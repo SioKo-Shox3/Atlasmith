@@ -89,6 +89,12 @@ technique-selection.md に記録して決定し、決定後にここへ前提を
   画素転写だけでは照明的に不正確 — 照明的正しさは保証外)。
 - **OBJ は basecolor のみ保持**(trimesh の `SimpleMaterial` の制約により、normal・
   metallic_roughness は OBJ 書き出し時に落ちる — 2026-07-10 実測)。
+- **OBJ/glTF のサイドカーファイル名は出力パスの stem から導出する**(例: `left.obj` →
+  `left.mtl`/`left.png`、`left.gltf` → `left_gltf_buffer_0.bin` 等)。trimesh の既定
+  エクスポータはサイドカー名を固定(`material.mtl`/`gltf_buffer_0.bin` 等、出力パスに
+  非依存)で返すため、stem 導出をしないと同一ディレクトリへの複数メッシュ保存でサイド
+  カーが衝突し、2件目が1件目を黙って上書きする(2026-07-11 verifier 発見・修正済み —
+  Step 0-4b)。
 
 ## 危険地帯(変更時に必ず計画レビューを通す領域)
 

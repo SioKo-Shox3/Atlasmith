@@ -1,6 +1,7 @@
 """Step 0-4 io ラウンドトリップテスト(test-design-step0-4.md 第2部 ケース表準拠)。
 
 ケースID(R1/V1/X1/M1/Q1/P1/N1/N2/N3/U1)は test-design-step0-4.md と対応させる。
+C1/C2 は Step 0-4b/0-4c(verifier 発見バグの回帰テスト、test-design 外の追加ケース)。
 """
 
 from __future__ import annotations
@@ -75,6 +76,122 @@ def test_r1_round_trip_preserves_geometry_and_texture(
     assert loaded.maps["basecolor"].shape == texture.shape
     max_diff = np.abs(loaded.maps["basecolor"] - texture).max()
     assert max_diff <= PIXEL_ATOL
+
+
+# ---------------------------------------------------------------------------
+# C1: 同一ディレクトリへの複数保存でサイドカーが衝突しないこと(Step 0-4b 回帰)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ext", [".obj", ".gltf"])
+def test_c1_multiple_meshes_same_directory_do_not_clobber_sidecars(
+    cube_mesh, tmp_path, ext
+):
+    """OBJ/glTF は mtl/画像やバッファをサイドカーファイルとして書き出す。
+
+    サイドカー名が出力パスの stem から一意に導出されず固定名(例:
+    `material.mtl`/`material_0.png`, `gltf_buffer_0.bin`)のままだと、同一
+    ディレクトリへ異なるテクスチャの2メッシュを保存したとき2件目が1件目の
+    サイドカーを黙って上書きし、1件目を読み戻すと2件目のテクスチャが返る
+    (静かなデータ破損)。verifier が発見した実バグの回帰テスト。
+
+    WHY(verifier 再検証で判明): `make_texture("gradient", seed=...)` は
+    gradient が seed 非依存のため2枚が bit 同一になり、衝突しても検出できず
+    テストが空虚化していた。ここでは異なるチャンネルに値を置いた明示的な
+    配列を使い、冒頭で非同一性をガードして将来の差し替えでも空虚化を防ぐ。
+    """
+    texture_left = np.zeros((64, 64, 3), dtype=np.float32)
+    texture_left[:, :, 0] = 0.9
+    texture_left = (np.round(texture_left * 255.0) / 255.0).astype(np.float32)
+
+    texture_right = np.zeros((64, 64, 3), dtype=np.float32)
+    texture_right[:, :, 2] = 0.9
+    texture_right = (np.round(texture_right * 255.0) / 255.0).astype(np.float32)
+
+    assert not np.array_equal(texture_left, texture_right)
+
+    # 幾何は使い回し、テクスチャだけ変えた独立メッシュを2つ用意する
+    # (サイドカー名衝突はテクスチャ/マテリアルのサイドカーファイルで起きる)。
+    mesh_left = MeshData(
+        vertices=cube_mesh.vertices.copy(),
+        faces=cube_mesh.faces.copy(),
+        uv=cube_mesh.uv.copy(),
+        maps={"basecolor": texture_left},
+        source_vertex=cube_mesh.source_vertex.copy(),
+    )
+    mesh_right = MeshData(
+        vertices=cube_mesh.vertices.copy(),
+        faces=cube_mesh.faces.copy(),
+        uv=cube_mesh.uv.copy(),
+        maps={"basecolor": texture_right},
+        source_vertex=cube_mesh.source_vertex.copy(),
+    )
+
+    path_left = tmp_path / f"left{ext}"
+    path_right = tmp_path / f"right{ext}"
+    save_mesh(mesh_left, path_left)
+    save_mesh(mesh_right, path_right)
+
+    loaded_left = load_mesh(path_left)
+    loaded_right = load_mesh(path_right)
+
+    max_diff_left = np.abs(loaded_left.maps["basecolor"] - texture_left).max()
+    max_diff_right = np.abs(loaded_right.maps["basecolor"] - texture_right).max()
+    assert max_diff_left <= PIXEL_ATOL
+    assert max_diff_right <= PIXEL_ATOL
+
+
+# ---------------------------------------------------------------------------
+# C2: 非 ASCII(Unicode のみ)stem 同士のサイドカー衝突が残っていないこと
+# ---------------------------------------------------------------------------
+
+
+def test_c2_unicode_only_stems_do_not_clobber_sidecars_obj(cube_mesh, tmp_path):
+    """`_material_name_for_stem` が非 ASCII stem を単純な文字置換だけで作ると、
+
+    例えば `"赤"`/`"青"` がともに `"_"` へ潰れて `_.mtl`/`_.png` を共有し、
+    同一ディレクトリ保存で1件目が破損する(verifier 実測)。ハッシュ付与で
+    一意化した後もこの衝突が起きないことを確認する回帰テスト。glTF は
+    サイドカー名の導出に stem を無加工のまま使うため対象外(コーディネーター
+    裁定)。
+    """
+    texture_red = np.zeros((64, 64, 3), dtype=np.float32)
+    texture_red[:, :, 0] = 0.9
+    texture_red = (np.round(texture_red * 255.0) / 255.0).astype(np.float32)
+
+    texture_blue = np.zeros((64, 64, 3), dtype=np.float32)
+    texture_blue[:, :, 2] = 0.9
+    texture_blue = (np.round(texture_blue * 255.0) / 255.0).astype(np.float32)
+
+    assert not np.array_equal(texture_red, texture_blue)
+
+    mesh_red = MeshData(
+        vertices=cube_mesh.vertices.copy(),
+        faces=cube_mesh.faces.copy(),
+        uv=cube_mesh.uv.copy(),
+        maps={"basecolor": texture_red},
+        source_vertex=cube_mesh.source_vertex.copy(),
+    )
+    mesh_blue = MeshData(
+        vertices=cube_mesh.vertices.copy(),
+        faces=cube_mesh.faces.copy(),
+        uv=cube_mesh.uv.copy(),
+        maps={"basecolor": texture_blue},
+        source_vertex=cube_mesh.source_vertex.copy(),
+    )
+
+    path_red = tmp_path / "赤.obj"
+    path_blue = tmp_path / "青.obj"
+    save_mesh(mesh_red, path_red)
+    save_mesh(mesh_blue, path_blue)
+
+    loaded_red = load_mesh(path_red)
+    loaded_blue = load_mesh(path_blue)
+
+    max_diff_red = np.abs(loaded_red.maps["basecolor"] - texture_red).max()
+    max_diff_blue = np.abs(loaded_blue.maps["basecolor"] - texture_blue).max()
+    assert max_diff_red <= PIXEL_ATOL
+    assert max_diff_blue <= PIXEL_ATOL
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,38 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node 'C:/Users/KINGkawamura/Documents/Atlasmith/.codex/hooks/codex-impl-guard.mjs'; exit $LASTEXITCODE",
+            "statusMessage": "Atlasmith implementation-routing guard"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node 'C:/Users/KINGkawamura/Documents/Atlasmith/.codex/hooks/mirror-guard.mjs'; exit $LASTEXITCODE",
+            "statusMessage": "CLAUDE.md/AGENTS.md mirror guard"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node 'C:/Users/KINGkawamura/Documents/Atlasmith/.codex/hooks/session-start-reminder.mjs'; exit $LASTEXITCODE",
+            "statusMessage": "Atlasmith workflow reminder"
+          }
+        ]
+      }
+    ]
+  }
+}

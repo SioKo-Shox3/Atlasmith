@@ -1,0 +1,13 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+*.egg-info/
+
+# Claude Code(マシンローカル設定・ワークツリー)
+.claude/settings.local.json
+.claude/worktrees/

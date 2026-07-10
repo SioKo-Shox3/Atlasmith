@@ -1,0 +1,303 @@
+"""Step 0-4 io ラウンドトリップテスト(test-design-step0-4.md 第2部 ケース表準拠)。
+
+ケースID(R1/V1/X1/M1/Q1/P1/N1/N2/N3/U1)は test-design-step0-4.md と対応させる。
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import trimesh
+from PIL import Image
+
+from atlasmith.io.mesh import load_mesh, save_mesh
+from atlasmith.types import MeshData
+
+VERTEX_ATOL = 1e-5
+UV_ATOL = 1e-6
+PIXEL_ATOL = 1e-6
+
+MESH_FIXTURES = ("cube_mesh", "sphere_mesh", "torus_mesh")
+FORMATS = (".glb", ".gltf", ".obj")
+
+# R1 の 9 combos のうち torus_mesh の3件だけ RGBA(4ch)にして、チャンネル数保存
+# (RGB が往復で RGBA に化けないか)を回帰テストする(前任が実測しかけていた懸念)。
+_CHANNELS_BY_MESH = {"cube_mesh": 3, "sphere_mesh": 3, "torus_mesh": 4}
+
+
+def _bilinear_sample(img: np.ndarray, u: float, v: float) -> np.ndarray:
+    """テスト側の独立バイリニアサンプラ(横断規約の UV↔テクセル変換式に準拠)。
+
+    production 側に実装が無い Step 0-4 時点でも、V1/X1 の検証は「本実装のロー
+    ダが返した配列」を独立ロジックでサンプルすることで担保する。
+    """
+    height, width = img.shape[:2]
+    x = u * width - 0.5
+    y = v * height - 0.5
+    x0 = int(np.floor(x))
+    y0 = int(np.floor(y))
+    x1, y1 = x0 + 1, y0 + 1
+    fx, fy = x - x0, y - y0
+    x0c, x1c = int(np.clip(x0, 0, width - 1)), int(np.clip(x1, 0, width - 1))
+    y0c, y1c = int(np.clip(y0, 0, height - 1)), int(np.clip(y1, 0, height - 1))
+    top = img[y0c, x0c] * (1 - fx) + img[y0c, x1c] * fx
+    bottom = img[y1c, x0c] * (1 - fx) + img[y1c, x1c] * fx
+    return top * (1 - fy) + bottom * fy
+
+
+# ---------------------------------------------------------------------------
+# R1: 往復 [glb/gltf/obj] x [cube/sphere/torus]
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ext", FORMATS)
+@pytest.mark.parametrize("mesh_name", MESH_FIXTURES)
+def test_r1_round_trip_preserves_geometry_and_texture(
+    request, mesh_name, ext, tmp_path, make_texture
+):
+    mesh = request.getfixturevalue(mesh_name)
+    channels = _CHANNELS_BY_MESH[mesh_name]
+    texture = make_texture(
+        "gradient", size=(64, 64), channels=channels, seed=0, quantize8=True
+    )
+    mesh.maps = {"basecolor": texture}
+
+    path = tmp_path / f"mesh{ext}"
+    save_mesh(mesh, path)
+    loaded = load_mesh(path)
+
+    assert loaded.vertices.shape == mesh.vertices.shape
+    assert loaded.faces.shape == mesh.faces.shape
+    np.testing.assert_allclose(loaded.vertices, mesh.vertices, atol=VERTEX_ATOL)
+    assert loaded.uv is not None
+    np.testing.assert_allclose(loaded.uv, mesh.uv, atol=UV_ATOL)
+    assert set(loaded.maps.keys()) == {"basecolor"}
+    assert loaded.maps["basecolor"].shape == texture.shape
+    max_diff = np.abs(loaded.maps["basecolor"] - texture).max()
+    assert max_diff <= PIXEL_ATOL
+
+
+# ---------------------------------------------------------------------------
+# V1: GLB ローダの V 方向(独立ライター → 本実装ローダ)
+# ---------------------------------------------------------------------------
+
+
+def test_v1_glb_loader_v_direction(tmp_path):
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype=np.float64)
+    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+    uv = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float64)
+    texture = np.zeros((4, 4, 3), dtype=np.uint8)
+    texture[0, :, :] = [255, 0, 0]  # row0 = 画像上端 = 赤
+    texture[1, :, :] = [0, 255, 0]
+    texture[2, :, :] = [0, 128, 255]
+    texture[3, :, :] = [0, 0, 255]  # 最終行 = 青
+    image = Image.fromarray(texture, mode="RGB")
+
+    # trimesh を直接叩いて GLB を書く(本実装の save_mesh は使わない — ローダ単体
+    # を独立ライターで固定検証するため、V1 は往復では見えない対称バグを検出する)。
+    material = trimesh.visual.material.PBRMaterial(baseColorTexture=image)
+    visual = trimesh.visual.texture.TextureVisuals(
+        uv=uv, material=material, image=image
+    )
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, visual=visual, process=False)
+    path = tmp_path / "v1.glb"
+    mesh.export(str(path))
+
+    loaded = load_mesh(path)
+    basecolor = loaded.maps["basecolor"]
+    np.testing.assert_allclose(basecolor[0, 0], [1.0, 0.0, 0.0], atol=1e-6)
+
+    # 頂点0・1は uv の v=0 側 → コーナーサンプルは赤であるべき。
+    for vertex_index in (0, 1):
+        u, v = loaded.uv[vertex_index]
+        color = _bilinear_sample(basecolor, float(u), float(v))
+        np.testing.assert_allclose(color, [1.0, 0.0, 0.0], atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# X1: OBJ の V/面取り(クロス形式で GLB 経路と一致)
+# ---------------------------------------------------------------------------
+
+
+def test_x1_obj_face_id_matches_glb_path(cube_mesh, tmp_path, make_face_id_texture):
+    texture = make_face_id_texture(cube_mesh, size=(64, 64))
+    cube_mesh.maps = {"basecolor": texture}
+
+    glb_path = tmp_path / "x1.glb"
+    obj_path = tmp_path / "x1.obj"
+    save_mesh(cube_mesh, glb_path)
+    save_mesh(cube_mesh, obj_path)
+
+    glb_loaded = load_mesh(glb_path)
+    obj_loaded = load_mesh(obj_path)
+
+    n_faces = len(cube_mesh.faces)
+    for face_index, face in enumerate(cube_mesh.faces):
+        centroid_uv = cube_mesh.uv[face].mean(axis=0)
+        expected_ch0 = (face_index + 0.5) / n_faces
+        expected = np.array([expected_ch0, 1.0 - expected_ch0, 0.5], dtype=np.float32)
+
+        glb_color = _bilinear_sample(
+            glb_loaded.maps["basecolor"], float(centroid_uv[0]), float(centroid_uv[1])
+        )
+        obj_color = _bilinear_sample(
+            obj_loaded.maps["basecolor"], float(centroid_uv[0]), float(centroid_uv[1])
+        )
+
+        np.testing.assert_allclose(glb_color, expected, atol=0.05)
+        np.testing.assert_allclose(obj_color, expected, atol=0.05)
+        np.testing.assert_allclose(obj_color, glb_color, atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# M1: 複数マップ GLB(basecolor + normal + metallic_roughness)
+# ---------------------------------------------------------------------------
+
+
+def test_m1_multiple_maps_round_trip_glb(cube_mesh, tmp_path, make_texture):
+    basecolor = make_texture(
+        "gradient", size=(64, 64), channels=3, seed=1, quantize8=True
+    )
+    normal = make_texture(
+        "multisine", size=(64, 64), channels=3, seed=2, quantize8=True
+    )
+    metallic_roughness = make_texture(
+        "aperiodic", size=(64, 64), channels=3, seed=3, quantize8=True
+    )
+    cube_mesh.maps = {
+        "basecolor": basecolor,
+        "normal": normal,
+        "metallic_roughness": metallic_roughness,
+    }
+
+    path = tmp_path / "m1.glb"
+    save_mesh(cube_mesh, path)
+    loaded = load_mesh(path)
+
+    assert set(loaded.maps.keys()) == {"basecolor", "normal", "metallic_roughness"}
+    for name, expected in cube_mesh.maps.items():
+        np.testing.assert_allclose(loaded.maps[name], expected, atol=PIXEL_ATOL)
+
+
+# ---------------------------------------------------------------------------
+# Q1: 非正方解像度([glb])
+# ---------------------------------------------------------------------------
+
+
+def test_q1_non_square_resolution_round_trip(cube_mesh, tmp_path, make_texture):
+    texture = make_texture(
+        "gradient", size=(32, 64), channels=3, seed=4, quantize8=True
+    )
+    cube_mesh.maps = {"basecolor": texture}
+
+    path = tmp_path / "q1.glb"
+    save_mesh(cube_mesh, path)
+    loaded = load_mesh(path)
+
+    assert loaded.maps["basecolor"].shape == (32, 64, 3)
+    np.testing.assert_allclose(loaded.maps["basecolor"], texture, atol=PIXEL_ATOL)
+
+
+# ---------------------------------------------------------------------------
+# P1: Unicode+空白パス([glb, obj])
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ext", [".glb", ".obj"])
+def test_p1_unicode_and_space_path_round_trip(cube_mesh, tmp_path, make_texture, ext):
+    texture = make_texture(
+        "gradient", size=(64, 64), channels=3, seed=5, quantize8=True
+    )
+    cube_mesh.maps = {"basecolor": texture}
+
+    unicode_dir = tmp_path / "日本語 スペース"
+    unicode_dir.mkdir()
+    path = unicode_dir / f"mesh{ext}"
+
+    save_mesh(cube_mesh, path)
+    loaded = load_mesh(path)
+
+    assert loaded.vertices.shape == cube_mesh.vertices.shape
+    assert loaded.faces.shape == cube_mesh.faces.shape
+    assert loaded.maps["basecolor"].shape == texture.shape
+
+
+# ---------------------------------------------------------------------------
+# N1: テクスチャ無し OBJ(負の対照 — maps のデフォルト捏造禁止)
+# ---------------------------------------------------------------------------
+
+
+def test_n1_obj_without_texture_yields_empty_maps(tmp_path):
+    obj_text = "v 0.0 0.0 0.0\nv 1.0 0.0 0.0\nv 1.0 1.0 0.0\nf 1 2 3\n"
+    path = tmp_path / "n1.obj"
+    path.write_text(obj_text, encoding="utf-8", newline="\n")
+
+    loaded = load_mesh(path)
+
+    assert loaded.uv is None
+    assert loaded.maps == {}
+
+
+# ---------------------------------------------------------------------------
+# N2: 複数メッシュ GLB(明確な英語 ValueError で拒否)
+# ---------------------------------------------------------------------------
+
+
+def test_n2_multi_mesh_glb_raises_value_error(cube_mesh, tmp_path):
+    mesh_a = trimesh.Trimesh(
+        vertices=cube_mesh.vertices, faces=cube_mesh.faces, process=False
+    )
+    mesh_b = mesh_a.copy()
+    mesh_b.apply_translation([5.0, 0.0, 0.0])
+    scene = trimesh.Scene()
+    scene.add_geometry(mesh_a, node_name="a")
+    scene.add_geometry(mesh_b, node_name="b")
+    path = tmp_path / "n2.glb"
+    scene.export(str(path))
+
+    with pytest.raises(ValueError, match="single mesh"):
+        load_mesh(path)
+
+
+# ---------------------------------------------------------------------------
+# N3: 不在パス/未対応拡張子
+# ---------------------------------------------------------------------------
+
+
+def test_n3_missing_file_raises_file_not_found(tmp_path):
+    path = tmp_path / "missing.glb"
+    with pytest.raises(FileNotFoundError, match=r"missing\.glb"):
+        load_mesh(path)
+
+
+def test_n3_unsupported_extension_raises_value_error(tmp_path):
+    path = tmp_path / "mesh.stl"
+    path.write_text("not a real mesh", encoding="utf-8", newline="\n")
+    with pytest.raises(ValueError, match=r"\.stl"):
+        load_mesh(path)
+
+
+# ---------------------------------------------------------------------------
+# U1: uv=None の保存(None uv での save クラッシュ・空 UV の捏造を禁止)
+# ---------------------------------------------------------------------------
+
+
+def test_u1_uv_none_round_trip(tmp_path):
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype=np.float64)
+    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+    mesh = MeshData(
+        vertices=vertices,
+        faces=faces,
+        uv=None,
+        maps={},
+        source_vertex=np.arange(4, dtype=np.int64),
+    )
+    path = tmp_path / "u1.glb"
+
+    save_mesh(mesh, path)
+    loaded = load_mesh(path)
+
+    assert loaded.uv is None
+    assert loaded.maps == {}
+    np.testing.assert_allclose(loaded.vertices, vertices, atol=VERTEX_ATOL)
+    assert loaded.faces.shape == faces.shape

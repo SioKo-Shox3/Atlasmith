@@ -8,7 +8,7 @@
 
 ## 型・ライブラリの規約
 
-- **Python 3.12+**(正確な下限は pyproject.toml が正 — スキャフォールド時に確定)。
+- **Python 3.11+**(正確な下限は pyproject.toml が正)。
 - **公開関数・メソッドには型ヒント必須。** `Any` への逃げは WHY コメント付きでのみ許可。
 - 標準ライブラリで足りるものに依存を増やさない。依存追加は技術選定
   ([technique-selection.md](technique-selection.md))+ユーザー承認を通す

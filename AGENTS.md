@@ -17,9 +17,11 @@
 
 ## プロジェクト概要
 
-Atlasmith は**構想段階**のプロジェクト(2026-07-10 時点)— 目的・スコープは未確定。
-実装言語は **Python** に決定済み(ruff / pytest を採用予定)。ライセンスは Apache-2.0。
-構想が確定したら `Docs/agent-guide/architecture.md` に反映し、この節を書き直す。
+Atlasmith は、AI生成3Dモデル(Tripo/Meshy/Hunyuan3D 等)の乱雑な UV を部位単位アイランドへ再編成し、既存テクスチャを新UVへ焼き直す Python 製 CLI ツール(ライセンス Apache-2.0)。
+パイプラインは5段: ①部位分割(ML: PartField 予定・optional、幾何フォールバック付き)②シーム決定 ③平面展開(libigl SLIM 予定)④パッキング(xatlas)⑤テクスチャ焼き直し。①のみ ML、②〜⑤は決定的アルゴリズムのハイブリッド構成。
+現状: Phase 0(雛形+GLB/glTF/OBJ 入出力)実装済み、Phase 1(⑤焼き直し)実装中、Phase 2 以降(①〜④)は未着手。
+スタック確定: Python 3.11+(開発 pin 3.12)/ uv + hatchling / trimesh / numpy / xatlas / Pillow / ruff / pytest(技術選定記録: `Docs/agent-guide/technique-*.md`)。
+詳細は `Docs/agent-guide/architecture.md` 参照。
 
 ## 絶対規則(non-negotiables)
 

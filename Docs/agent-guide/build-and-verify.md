@@ -2,15 +2,12 @@
 
 <!-- コマンドは全てコピペで動く形で書く。「証拠」の基準(何を貼れば Done と言えるか)も定義する。 -->
 
-> **状態: コード未着地(2026-07-10)— 現時点で実行可能なゲートは存在しない。**
-> 下記は確定済みツール(ruff / pytest)前提の雛形。初回スキャフォールドで実際に動くことを
-> 確認してからこの注記を外す。パッケージ/環境マネージャは **uv を第一候補** とする
-> (未確定 — technique-selection.md で確定させる)。
+> **状態: ゲートは実運用中(2026-07-10 スキャフォールド着地)。**
 
 ## 前提・セットアップ
 
 ```
-# Python 3.12+ / uv(候補)
+# Python 3.11+(開発 pin は 3.12、pyproject.toml が正)/ uv
 uv sync              # 依存の同期(pyproject.toml + uv.lock)
 ```
 
@@ -50,3 +47,4 @@ uv run pytest                   # テスト
 
 - `.venv/`、`__pycache__/`、`.pytest_cache/`、`.ruff_cache/`、`dist/`、`*.egg-info/`
 - `.claude/settings.local.json`(マシンローカル)、`.claude/worktrees/`
+- 例外: `uv.lock` はコミット対象(再現可能な依存解決のため)

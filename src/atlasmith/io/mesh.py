@@ -16,10 +16,14 @@ io 層で追加の V 反転を行う必要はない。trimesh をバージョン
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from pathlib import Path
 
 import numpy as np
 import trimesh
+from trimesh.exchange.gltf import export_gltf
 
 from atlasmith.io.image import _array_to_pil, _pil_to_array
 from atlasmith.types import MeshData
@@ -120,10 +124,36 @@ def load_mesh(path: str | Path) -> MeshData:
     )
 
 
-def _build_visual(mesh: MeshData) -> trimesh.visual.texture.TextureVisuals | None:
+def _material_name_for_stem(stem: str) -> str:
+    """OBJ の `newmtl`/画像ファイル名の基礎として安全な識別子を stem から作る。
+
+    WHY: trimesh の `SimpleMaterial.to_obj()` は `material.name` をそのまま
+    `newmtl <name>` トークンと画像ファイル名(`{name}.png`)の両方に使う。
+    stem に空白等が含まれると OBJ の空白区切りトークンとして壊れるため、
+    ファイル名としての「stem 由来」は保ちつつ英数字・`_`・`-` のみに正規化する。
+
+    WHY(バグ修正 Step 0-4c): 単純な文字置換(非対応文字→`_`)だけでは非可逆
+    (元の stem を復元できない)ため、異なる stem が同じ結果へ潰れて衝突しう
+    る(実測: `"赤"`/`"青"` がともに `"_"` へ潰れ、同一ディレクトリ保存で
+    サイドカーが衝突する)。置換結果が元の stem と一致しない場合(=非 ASCII
+    文字や記号を含み情報が失われた場合)は、元 stem の UTF-8 バイト列の
+    sha1 先頭8桁 hex を付与して一意化する。ASCII のみの stem(`left` 等)は
+    そのまま返し、見た目を変えない。
+    """
+    sanitized = re.sub(r"[^0-9A-Za-z_-]", "_", stem)
+    if sanitized == stem and sanitized.strip("_"):
+        return sanitized
+    digest = hashlib.sha1(stem.encode("utf-8")).hexdigest()[:8]
+    base = sanitized.strip("_")
+    return f"{base}_{digest}" if base else f"_{digest}"
+
+
+def _build_visual(
+    mesh: MeshData, material_name: str
+) -> trimesh.visual.texture.TextureVisuals | None:
     if mesh.uv is None:
         return None
-    material = trimesh.visual.material.PBRMaterial()
+    material = trimesh.visual.material.PBRMaterial(name=material_name)
     basecolor_image = None
     basecolor = mesh.maps.get("basecolor")
     if basecolor is not None:
@@ -140,12 +170,49 @@ def _build_visual(mesh: MeshData) -> trimesh.visual.texture.TextureVisuals | Non
     )
 
 
+def _export_gltf_with_stem_sidecars(tri_mesh: trimesh.Trimesh, path: Path) -> None:
+    """glTF 分離形式を、サイドカー名を出力ファイルの stem から一意に導出して書き出す。
+
+    WHY(バグ修正 Step 0-4b): `trimesh.exchange.gltf.export_gltf()` が返すサイド
+    カー名は常に固定(`gltf_buffer_0.bin` 等、出力パスに非依存)。実測の結果、
+    `export_gltf()` にはこれを制御する引数が無いため、返ってきた
+    `{ファイル名: バイト列}` 辞書を post-process する: `model.gltf` 以外の
+    キーへ stem プレフィックスを付けて改名し、JSON 内の `buffers`/`images` の
+    `uri` 参照も同じ対応表で書き換えてから書き出す。これにより同一ディレクトリ
+    へ異なるメッシュを複数 `.gltf` 保存しても、2件目が1件目のサイドカーを
+    黙って上書きしなくなる(実測: 改名後のファイル名衝突なし、往復読み込みで
+    元の色が保たれることを確認済み)。
+    """
+    files = export_gltf(tri_mesh)
+    stem = path.stem
+    rename_map = {name: f"{stem}_{name}" for name in files if name != "model.gltf"}
+
+    tree = json.loads(files["model.gltf"])
+    for buffer in tree.get("buffers", []):
+        uri = buffer.get("uri")
+        if uri in rename_map:
+            buffer["uri"] = rename_map[uri]
+    for image in tree.get("images", []):
+        uri = image.get("uri")
+        if uri in rename_map:
+            image["uri"] = rename_map[uri]
+
+    output_files = {path.name: json.dumps(tree, separators=(",", ":")).encode("utf-8")}
+    for name, data in files.items():
+        if name != "model.gltf":
+            output_files[rename_map[name]] = data
+
+    for name, data in output_files.items():
+        (path.parent / name).write_bytes(data)
+
+
 def save_mesh(mesh: MeshData, path: str | Path) -> None:
     """`MeshData` を GLB/glTF/OBJ ファイルへ書き出す。"""
     path = Path(path)
-    _check_extension(path)
+    ext = _check_extension(path)
 
-    visual = _build_visual(mesh)
+    material_name = _material_name_for_stem(path.stem)
+    visual = _build_visual(mesh, material_name)
     tri_mesh = trimesh.Trimesh(
         vertices=np.asarray(mesh.vertices, dtype=np.float64),
         faces=np.asarray(mesh.faces, dtype=np.int64),
@@ -153,4 +220,14 @@ def save_mesh(mesh: MeshData, path: str | Path) -> None:
         process=False,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    tri_mesh.export(str(path))
+
+    if ext == ".gltf":
+        # サイドカー名(gltf_buffer_N.bin 等)は stem 由来に改名する必要がある
+        # ため、標準の export() を経由せず専用ヘルパで書き出す(上記 WHY 参照)。
+        _export_gltf_with_stem_sidecars(tri_mesh, path)
+    elif ext == ".obj":
+        # mtl_name を明示し、mtl/画像ファイル名の衝突(同一ディレクトリへの
+        # 複数保存で "material.mtl"/"material_0.png" に固定される問題)を防ぐ。
+        tri_mesh.export(str(path), mtl_name=f"{material_name}.mtl")
+    else:  # .glb — 単一ファイルでサイドカーが無いため衝突しない。
+        tri_mesh.export(str(path))

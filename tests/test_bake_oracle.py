@@ -6,8 +6,12 @@
 `mesh.faces[face_map]` で旧面を行整列してから `bake_maps` を呼ぶ(裁定5)。
 
 ゲート(いずれも確定値表・512^2 新 atlas / 256^2 旧 multisine / padding 8):
-- O1 主ゲート: 内部点・multisine で PSNR >= 40 dB。
-- O2 シーム帯: PSNR >= 20 dB(緩い枠)。
+- O1 主ゲート: 内部点・multisine で PSNR >= 40 dB。3ch 単一 map(既存)に加え、
+  2D 単チャンネル(scalar)map でも同じ内部点・同じ 40dB を課す(should-fix2 —
+  production の (H,W) 入力を (H,W,1) へ昇格する scalar 分岐を保護する)。
+- O2 シーム帯: 有効な non-wrap シーム点で PSNR >= 20 dB。wrap 点(周期シームを跨ぐ面の
+  点)は物理的に無意味なので PSNR ゲートから除外し、分類の正しさ(非空・extent 分離)
+  のみ検証する(should-fix1 — 下の WHY 参照)。
 - O3 負の対照: UV 0.1 シフト / V 反転 / チャンネル入替 が PSNR < 25 dB かつ
   正解 - 誤り >= 15 dB(識別力の証明)。shift/vflip は非周期、swap は直交チャンネルの
   gradient を用いる(下の WHY 参照)。
@@ -61,6 +65,7 @@ _NEG_MARGIN = 15.0  # 正解 - 誤り の下限。
 
 _MULTISINE_SEED = 1  # 主ゲート用平滑テクスチャ(freqs 3/7/13)のシード。
 _APERIODIC_SEED = 2  # 負の対照用非周期テクスチャのシード。
+_SCALAR_SEED = 3  # O1 scalar 版(2D 単チャンネル multisine)のシード。
 
 
 def _point_psnr(test_vals: np.ndarray, ref_vals: np.ndarray, mask: np.ndarray) -> float:
@@ -143,6 +148,9 @@ def _build_context(
     )
     interior = far_from_seam & ~wrap_point
     seam = ~interior  # シーム帯 = 内部でない全点(境界近傍 or wrap 面)。
+    # non-wrap シーム点 = 境界近傍だが周期シームを跨がない点。O2 の PSNR ゲート
+    # (>=20dB)はこれにのみ課す(should-fix1)。wrap 点は物理的に無意味なので除外。
+    nonwrap_seam = seam & ~wrap_point
 
     # --- テクスチャ焼き(全マップ 3ch。O1/O2/O4 は multisine、O3 は aperiodic)。---
     def bake_forward(uv_old_src: np.ndarray, tex: np.ndarray) -> np.ndarray:
@@ -167,6 +175,13 @@ def _build_context(
     tex_grad = make_texture("gradient", (_OLD_RES, _OLD_RES), 3)
 
     new_tex_ms = bake_forward(old_uv, tex_ms)
+    # O1 scalar 版(should-fix2): 2D 単チャンネル map。make_texture の channels=1 出力
+    # (H,W,1)を [..., 0] で真の 2D (H,W) に落とし、production の (H,W)->(H,W,1) 昇格
+    # 分岐(bake_maps の ndim!=3 経路)を経由させる。焼き上がりは (H,W,1) になる。
+    tex_scalar = make_texture("multisine", (_OLD_RES, _OLD_RES), 1, seed=_SCALAR_SEED)[
+        ..., 0
+    ]
+    new_tex_scalar = bake_forward(old_uv, tex_scalar)
     # O3 shift/vflip: 非周期の正対応 vs 旧 UV の誤対応(0.1 シフト / V 反転)。
     new_tex_correct_ap = bake_forward(old_uv, tex_ap)
     uv_shift = old_uv + np.float32(0.1)
@@ -203,10 +218,18 @@ def _build_context(
     return SimpleNamespace(
         interior=interior,
         seam=seam,
+        # should-fix1: wrap 点/ non-wrap シーム点/ 面別 wrap 分類を O2 が使う。
+        wrap_point=wrap_point,
+        nonwrap_seam=nonwrap_seam,
+        wrap_face=wrap_face,
+        old_extent=old_extent,
         n_total=len(interior),
         # O1/O2
         ref_ms=sample(tex_ms, old_pts),
         test_ms=sample(new_tex_ms, new_pts),
+        # O1 scalar 版(should-fix2)。ref (K,) を (K,1) に整形し test (K,1) に揃える。
+        ref_scalar=sample(tex_scalar, old_pts)[:, np.newaxis],
+        test_scalar=sample(new_tex_scalar, new_pts),
         # O3 shift/vflip(aperiodic)と swap(gradient)は基準・正解が別テクスチャ。
         ref_ap=sample(tex_ap, old_pts),
         correct_ap=sample(new_tex_correct_ap, new_pts),
@@ -265,12 +288,52 @@ def test_o1_main_gate_interior(mesh_fixture, oracle_context) -> None:
 
 
 @pytest.mark.parametrize("mesh_fixture", MESHES)
-def test_o2_seam_band(mesh_fixture, oracle_context) -> None:
-    """O2 シーム帯: 境界近傍/ wrap 面の点でも PSNR >= 20 dB(緩い枠)。"""
+def test_o1_main_gate_interior_scalar(mesh_fixture, oracle_context) -> None:
+    """O1 scalar 版(should-fix2): 2D 単チャンネル map を焼き内部点 PSNR >= 40 dB。
+
+    確定値表「basecolor/scalar 系を map 別に 40dB」の scalar 側、および production の
+    2D スカラー map 分岐(bake_maps が (H,W) 入力を (H,W,1) へ昇格する経路)を再展開後
+    オラクルで保護する。3ch 版 O1 と同じ内部点 membership・同じ 40dB 閾値を課す
+    (scalar 専用の閾値は作らない)。実測内部点 PSNR: cube 69.7 / sphere 58.3 /
+    torus 55.6 dB(いずれも 40dB を大きく超える — production の scalar 分岐は健全)。
+    """
     ctx = oracle_context(mesh_fixture)
-    assert ctx.seam.any()
-    psnr = _point_psnr(ctx.test_ms, ctx.ref_ms, ctx.seam)
+    assert ctx.interior.any()
+    psnr = _point_psnr(ctx.test_scalar, ctx.ref_scalar, ctx.interior)
+    assert psnr >= _GATE_O1
+
+
+@pytest.mark.parametrize("mesh_fixture", MESHES)
+def test_o2_seam_band(mesh_fixture, oracle_context) -> None:
+    """O2 シーム帯: non-wrap シーム点で PSNR >= 20 dB。wrap 点は分類の正しさのみ検証。
+
+    WHY 分離(should-fix1): 旧 O2 は wrap 点(周期シームを跨ぐ面の点。旧 UV が [0,1] を
+    折り返し基準値が物理的に無意味)と non-wrap シーム点を単一 mask に集約し1つの PSNR
+    で評価していた。実測 torus では wrap 単独 PSNR が 19.467 dB(20dB 未達)なのに、全
+    シーム集約は 25.529 dB になって PASS してしまい、「wrap 面の点でも 20dB」を実際には
+    証明できていなかった。物理的に無意味な wrap 点に PSNR 下限を課すのは誤りなので、
+    20dB ゲートは *有効な non-wrap シーム点*(境界近傍だが周期シームを跨がない点)にのみ
+    課し、wrap 点は「分類が正しいこと」だけを別 assert で検証する(PSNR は課さない)。
+    閾値 20dB は不変。実測 non-wrap PSNR: cube 68.6 / sphere 51.5 / torus 40.3 dB。
+    """
+    ctx = oracle_context(mesh_fixture)
+    # 20dB ゲートは有効な non-wrap シーム点にのみ課す(wrap 点は含めない)。
+    assert ctx.nonwrap_seam.any()
+    psnr = _point_psnr(ctx.test_ms, ctx.ref_ms, ctx.nonwrap_seam)
     assert psnr >= _GATE_O2
+    # wrap 点は PSNR ゲートを課さず、分類の正しさのみ検証する。
+    if ctx.wrap_face.any():
+        # 周期メッシュ(sphere/torus): wrap 点は非空で、旧 UV 三角形の軸別 extent が
+        # 周期の半分 0.5 で綺麗に分離する(実測 sphere 正規面 max 0.412 / wrap 面 min
+        # 0.824、torus 0.031 / 0.969)。この分離が 0.5 しきい値による wrap 分類の妥当性
+        # (境界ぎりぎりの面が無く分類が脆くない)を示す。
+        assert ctx.wrap_point.any()
+        assert float(ctx.old_extent[~ctx.wrap_face].max()) < _WRAP_EXTENT
+        assert float(ctx.old_extent[ctx.wrap_face].min()) > _WRAP_EXTENT
+    else:
+        # cube: UV パッチが 3x2 グリッドの小インセットで周期シームを持たない。wrap 面・
+        # wrap 点は存在しないので、その分類(空)が正しいことを確認する。
+        assert not ctx.wrap_point.any()
 
 
 @pytest.mark.parametrize("mesh_fixture", MESHES)

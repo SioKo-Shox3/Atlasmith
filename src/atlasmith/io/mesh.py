@@ -19,11 +19,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import urllib.parse
 from pathlib import Path
 
 import numpy as np
 import trimesh
 from trimesh.exchange.gltf import export_gltf
+from trimesh.resolvers import FilePathResolver
 
 from atlasmith.io.image import _array_to_pil, _pil_to_array
 from atlasmith.types import MeshData
@@ -34,6 +36,22 @@ _MAP_MATERIAL_ATTRS = {
     "normal": "normalTexture",
     "metallic_roughness": "metallicRoughnessTexture",
 }
+
+
+class _UnquotingFileResolver(FilePathResolver):
+    """glTF の percent-encoded な `uri` を decode してからファイルを探す resolver。
+
+    WHY(指摘3): save 側は glTF 2.0 仕様(URI 中の予約文字は percent-encode)に
+    従い、サイドカー参照 `uri` を `urllib.parse.quote(name, safe="")` で符号化する。
+    一方、ディスク上のサイドカーファイル名は仕様が指す「decode 後の名前」で書く。
+    trimesh の `FilePathResolver` は `uri` を生のファイル名として扱い decode しない
+    (resolvers.py `FilePathResolver.get` 実測)ため、この resolver を挟まないと
+    `a%23b_...bin` という存在しない名前を探して読み込みが壊れる。ASCII のみの
+    通常 stem では `quote`/`unquote` とも no-op なので既存挙動は不変。
+    """
+
+    def get(self, name: str):
+        return super().get(urllib.parse.unquote(name))
 
 
 def _check_extension(path: Path) -> str:
@@ -82,14 +100,22 @@ def _single_geometry(
 def load_mesh(path: str | Path) -> MeshData:
     """GLB/glTF/OBJ ファイルを読み、`MeshData` として返す。"""
     path = Path(path)
-    _check_extension(path)
+    ext = _check_extension(path)
     if not path.exists():
         raise FileNotFoundError(f"Mesh file not found: {path}")
 
     # process=False: trimesh 側の頂点マージ/後処理を無効化する。
     # WHY: 面ごとに独立した UV を持つメッシュ(例: cube fixture の 24 頂点)は
     # 位置だけ見ると重複するため、process=True だと想定外に welding されうる。
-    loaded = trimesh.load(path, process=False)
+    if ext == ".gltf":
+        # サイドカー `uri` は save 側で percent-encode 済み。trimesh の既定
+        # resolver は decode しないため、decode を挟む専用 resolver で読む
+        # (`_UnquotingFileResolver` の WHY 参照)。
+        loaded = trimesh.load(
+            path, process=False, resolver=_UnquotingFileResolver(str(path))
+        )
+    else:
+        loaded = trimesh.load(path, process=False)
     geom = _single_geometry(loaded, path)
 
     vertices = np.asarray(geom.vertices, dtype=np.float64)
@@ -185,17 +211,21 @@ def _export_gltf_with_stem_sidecars(tri_mesh: trimesh.Trimesh, path: Path) -> No
     """
     files = export_gltf(tri_mesh)
     stem = path.stem
+    # ディスク上のサイドカー名は生の(decode 後の)名前。JSON の `uri` はここから
+    # percent-encode して書く(glTF 2.0 は URI 中の予約文字 `#`/`?`/`%`/空白等の
+    # エンコードを要求する。例: stem に `#` を含むと fragment 扱いで参照が壊れる)。
+    # 読み戻しは `_UnquotingFileResolver` が decode して生の名前へ突き合わせる。
     rename_map = {name: f"{stem}_{name}" for name in files if name != "model.gltf"}
 
     tree = json.loads(files["model.gltf"])
     for buffer in tree.get("buffers", []):
         uri = buffer.get("uri")
         if uri in rename_map:
-            buffer["uri"] = rename_map[uri]
+            buffer["uri"] = urllib.parse.quote(rename_map[uri], safe="")
     for image in tree.get("images", []):
         uri = image.get("uri")
         if uri in rename_map:
-            image["uri"] = rename_map[uri]
+            image["uri"] = urllib.parse.quote(rename_map[uri], safe="")
 
     output_files = {path.name: json.dumps(tree, separators=(",", ":")).encode("utf-8")}
     for name, data in files.items():

@@ -9,8 +9,8 @@
 
 ## 全体構造
 
-- `src/atlasmith/types.py` — 公開 IR(`MeshData`)。**無依存**(他の atlasmith サブパッケージ・
-  外部ライブラリいずれも import しない)。
+- `src/atlasmith/types.py` — 公開 IR(`MeshData`)。他の atlasmith サブパッケージに依存せず、
+  外部ライブラリは **numpy のみ**(フィールドが `np.ndarray` のため必須。trimesh/PIL/xatlas は import しない)。
 - `src/atlasmith/cli.py` — CLI エントリポイント(`atlasmith` コマンド)。他の全レイヤーを束ねる。
 - `src/atlasmith/io/`(Phase 0 実装済み)— メッシュ/画像 I/O。`load_mesh` / `save_mesh` /
   `load_image` / `save_image`。trimesh・Pillow はこの層に閉じ込める。
@@ -38,7 +38,7 @@ technique-selection.md に記録して決定し、決定後にここへ前提を
 - `pack` → `types`(+ xatlas)
 - `io` → `types`(+ trimesh / Pillow)
 - `bake` / `metrics` → **numpy のみ**(trimesh・xatlas・Pillow の import 禁止)
-- `types` は無依存
+- `types` → **numpy のみ**(atlasmith サブパッケージ・trimesh・xatlas・Pillow の import 禁止)
 
 上記と逆向きの import は禁止(例: `io` が `cli` を import しない、`bake` が `pack` を import
 しない)。`bake`/`metrics` を numpy 専用に保つのは、依存を増やさず境界を証明可能にするため

@@ -11,3 +11,6 @@ dist/
 # Claude Code(マシンローカル設定・ワークツリー)
 .claude/settings.local.json
 .claude/worktrees/
+
+# ローカルデモ生成物(examples/make_demo_assets.py の出力。コミットしない)
+examples/*.glb

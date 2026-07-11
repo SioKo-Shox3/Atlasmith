@@ -64,19 +64,14 @@ process.stdin.on("end", () => {
         `BLOCKED by the ${PROJECT} workflow guard: the main thread must NOT ` +
           "type implementation code directly.\n\n" +
           "CLAUDE.md workflow: the main thread plans, integrates, and REVIEWS; " +
-          "implementation routes by task shape — spec-complete to Codex via " +
-          "direct CLI, ambiguous/cross-cutting to the `implementer` subagent. " +
-          "Every non-trivial change then gets a top-model first review plus a " +
-          "mandatory Codex second review via DIRECT CLI (never the codex plugin).\n\n" +
+          "implementation is delegated to the `implementer` subagent " +
+          "(.claude/agents/implementer.md). Cross-CLI implementation handoff " +
+          "is abolished (2026-07-12) — the partner AI only does second " +
+          "reviews and consultations.\n\n" +
           `Refused edit: ${filePath}\n\n` +
-          "Do this instead:\n" +
-          "  1. Route the change: spec-complete -> `codex exec --sandbox " +
-          "workspace-write` (with the no-loop clause); ambiguous -> the " +
-          "`implementer` subagent (.claude/agents/implementer.md) — either way " +
-          "with the approved plan, allowed write paths, and conventions.\n" +
-          "  2. First review: impl-reviewer subagent. Second review (mandatory): " +
-          "`codex exec --sandbox read-only ...` — direct CLI, synchronous.\n" +
-          "  3. Only then stage + commit.\n\n" +
+          "Hand the change to the `implementer` subagent with the approved " +
+          "plan, allowed write paths, and conventions. Reviews and scope " +
+          "verification happen at the integration point, per CLAUDE.md.\n\n" +
           "Deliberate, user-approved override for ONE session: relaunch " +
           `Claude Code with env ${OVERRIDE_ENV}=1.\n`,
       );

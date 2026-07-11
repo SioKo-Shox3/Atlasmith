@@ -253,3 +253,142 @@ def _build_face_id_texture(
 @pytest.fixture
 def make_face_id_texture() -> Callable[..., np.ndarray]:
     return _build_face_id_texture
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 独立実装(裁定9 + Step 1-1 二重レビュー追補)
+#
+# production(src/atlasmith/bake/transfer.py)とは *独立に設計された* オラクル/評価道具。
+# レビュー指摘(Opus: 逐語コピーで独立性が形式的 / Codex: CW 面で corner 1/2 を戻し
+# 忘れる実バグ)を受け、production の「meshgrid ベクトル化 + edge 関数 + top-left
+# tie-break + 巻き順スワップ」という構造をあえて共有しない別実装にしている:
+#   - 内外判定: 3 つの部分三角形の符号付き 2 倍面積(sub-triangle area)方式。
+#     production の edge 関数とは変数の持ち方が異なる。
+#   - 重心座標: 常に入力 faces_uv の *元の corner 順* (0,1,2) で算出する。頂点の内部
+#     並べ替え(巻き順スワップ)を一切しないので、CW 面でも corner 1/2 が入れ替わらない
+#     (旧テスト実装が持っていた欠陥を「戻し処理」ではなく構造で排除している)。
+#   - tie-break: 共有辺は「先に走査した = face_id が小さい面が所有」する規則(production
+#     の top-left とは別規則だが決定的)。face_id/bary は最小 face_id の面のものになる。
+#   - 走査: 面ごとの bbox を素朴に per-texel 走査(遅くてよい / test-design 準拠)。
+#   - 定数も独自に選定(production の 1e-9 / 1e-12 を流用しない)。
+# ---------------------------------------------------------------------------
+
+# 正規化済み重心座標での辺の許容(production の _BARY_EPS=1e-9 とは別値を独自選定)。
+_INSIDE_EPS = 1e-7
+# 縮退三角形(テクセル空間の符号付き 2 倍面積がほぼ 0)の除外しきい値(独自選定)。
+_MIN_DOUBLE_AREA = 1e-10
+
+
+def _double_area(
+    ax: float, ay: float, bx: float, by: float, cx: float, cy: float
+) -> float:
+    """三角形 (a, b, c) の符号付き 2 倍面積(2D 外積の z 成分)。CCW で正・CW で負。"""
+    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+
+
+def _rasterize_coverage(
+    faces_uv: np.ndarray, uv: np.ndarray, size: tuple[int, int]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """独立ラスタライザ(sub-triangle area・元 corner 順・最小 face_id tie-break)。
+
+    戻り値 (cov (H,W) bool, face_id (H,W) int64 無被覆-1, bary (H,W,3) float64)。
+    テクセル中心 UV = ((c+0.5)/W, (r+0.5)/H)。texel 空間で中心は (x=c, y=r)。
+    bary[r,c] は face_id の面の入力 corner 順 (faces_uv[i,0..2]) に対する重心。
+    """
+    height, width = size
+    cov = np.zeros((height, width), dtype=bool)
+    face_id = np.full((height, width), -1, dtype=np.int64)
+    bary = np.zeros((height, width, 3), dtype=np.float64)
+    uv = np.asarray(uv, dtype=np.float64)
+    for i, face in enumerate(faces_uv):
+        # 入力 corner 順のまま texel 空間へ置く。巻き順スワップをしないので、あとで
+        # corner を「元に戻す」処理が原理的に不要 — これが CW corner バグの構造的排除。
+        ax = float(uv[face[0], 0]) * width - 0.5
+        ay = float(uv[face[0], 1]) * height - 0.5
+        bx = float(uv[face[1], 0]) * width - 0.5
+        by = float(uv[face[1], 1]) * height - 0.5
+        cx = float(uv[face[2], 0]) * width - 0.5
+        cy = float(uv[face[2], 1]) * height - 0.5
+        area2 = _double_area(ax, ay, bx, by, cx, cy)  # CCW で正・CW で負
+        if abs(area2) < _MIN_DOUBLE_AREA:
+            continue  # 縮退面は転写に寄与しない。
+        # bbox を [0,W-1]x[0,H-1] に clamp(画像外・反対端への回り込みを遮断; C9)。
+        cmin = max(0, int(np.floor(min(ax, bx, cx))))
+        cmax = min(width - 1, int(np.ceil(max(ax, bx, cx))))
+        rmin = max(0, int(np.floor(min(ay, by, cy))))
+        rmax = min(height - 1, int(np.ceil(max(ay, by, cy))))
+        for r in range(rmin, rmax + 1):
+            py = float(r)  # テクセル中心の texel 空間 y。
+            for c in range(cmin, cmax + 1):
+                if cov[r, c]:
+                    continue  # tie-break: 既に小さい face_id が所有 → 上書きしない。
+                px = float(c)  # テクセル中心の texel 空間 x。
+                # 部分三角形の符号付き面積 / 全体面積 = 正規化重心(元 corner 順)。
+                # w0=対 corner0・w1=対 corner1・w2=対 corner2。巻き順に依らず corner に
+                # 正しく対応する(CW でも入れ替わらない)。
+                w0 = _double_area(px, py, bx, by, cx, cy) / area2
+                w1 = _double_area(ax, ay, px, py, cx, cy) / area2
+                w2 = _double_area(ax, ay, bx, by, px, py) / area2
+                if w0 >= -_INSIDE_EPS and w1 >= -_INSIDE_EPS and w2 >= -_INSIDE_EPS:
+                    cov[r, c] = True
+                    face_id[r, c] = i
+                    bary[r, c, 0] = w0
+                    bary[r, c, 1] = w1
+                    bary[r, c, 2] = w2
+    return cov, face_id, bary
+
+
+def _shift_bool(mask: np.ndarray, dr: int, dc: int, fill: bool) -> np.ndarray:
+    """近傍 `mask[r+dr, c+dc]` を (r, c) へ集める非循環シフト(np.roll 不使用)。"""
+    out = np.full_like(mask, fill)
+    height, width = mask.shape[:2]
+    r_src0, r_src1 = max(0, dr), min(height, height + dr)
+    c_src0, c_src1 = max(0, dc), min(width, width + dc)
+    r_dst0, r_dst1 = max(0, -dr), min(height, height - dr)
+    c_dst0, c_dst1 = max(0, -dc), min(width, width - dc)
+    if r_src0 < r_src1 and c_src0 < c_src1:
+        out[r_dst0:r_dst1, c_dst0:c_dst1] = mask[r_src0:r_src1, c_src0:c_src1]
+    return out
+
+
+def _dilate8(mask: np.ndarray, iters: int = 1) -> np.ndarray:
+    """8 近傍・非循環・border=False の二値膨張(np.roll 不使用)。"""
+    out = mask.copy()
+    for _ in range(iters):
+        acc = out.copy()
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                acc |= _shift_bool(out, dr, dc, False)
+        out = acc
+    return out
+
+
+def _erode8(mask: np.ndarray, iters: int = 1) -> np.ndarray:
+    """8 近傍・非循環・border=False の二値収縮(境界外は False 扱いで削れる)。"""
+    out = mask.copy()
+    for _ in range(iters):
+        acc = out.copy()
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                acc &= _shift_bool(out, dr, dc, False)
+        out = acc
+    return out
+
+
+@pytest.fixture
+def rasterize_coverage() -> Callable[..., tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    return _rasterize_coverage
+
+
+@pytest.fixture
+def erode8() -> Callable[..., np.ndarray]:
+    return _erode8
+
+
+@pytest.fixture
+def dilate8() -> Callable[..., np.ndarray]:
+    return _dilate8

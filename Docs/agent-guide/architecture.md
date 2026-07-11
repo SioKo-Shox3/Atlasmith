@@ -94,7 +94,15 @@ technique-selection.md に記録して決定し、決定後にここへ前提を
   エクスポータはサイドカー名を固定(`material.mtl`/`gltf_buffer_0.bin` 等、出力パスに
   非依存)で返すため、stem 導出をしないと同一ディレクトリへの複数メッシュ保存でサイド
   カーが衝突し、2件目が1件目を黙って上書きする(2026-07-11 verifier 発見・修正済み —
-  Step 0-4b)。
+  Step 0-4b)。glTF の `uri` は percent-encoding する(2026-07-12、Codex 遡及レビュー
+  指摘・修正済み)。
+- **既知の残存リスク(裁定済み・未対応)**: `tests/test_io_mesh.py` の V1(V方向検証)は
+  `save_mesh` を経由しないが、GLB の書き出しには production と同じ trimesh の exporter を
+  使う。trimesh の exporter/importer 双方に対称的な V 反転バグがあった場合、この検証では
+  検出できない(2026-07-12 Codex 遡及レビュー指摘)。raw バイト単位で GLB を手組みする
+  完全独立な fixture の実装コストが便益(trimesh は成熟した広く使われるライブラリで該当
+  バグの実績は無い)に見合わないと判断し、対応を見送った。trimesh の V 方向処理に疑義が
+  生じた場合、または Phase 2 でこの経路が信頼性の要になる場合に再評価する。
 
 ## 危険地帯(変更時に必ず計画レビューを通す領域)
 

@@ -392,3 +392,81 @@ def erode8() -> Callable[..., np.ndarray]:
 @pytest.fixture
 def dilate8() -> Callable[..., np.ndarray]:
     return _dilate8
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 Step 1-2 独立オラクル道具(裁定9、production 非 import)
+#
+# 一方向オラクル(test_bake_oracle.py)が使う「独立サンプラ」と「一様重心サンプル」。
+# サンプラは production の bake._bilinear_sample と *構造を変えて* 実装する(Step 1-1
+# レビューで「逐語コピーは独立性が形式的」と指摘されたため):
+#   - production は top/bottom の入れ子 lerp(先に水平、次に垂直)で合成する。
+#   - こちらは 4 隅の重み (1-tx)(1-ty) 等を明示計算し、4 隅画素を1本に束ねた重み和
+#     (einsum)で合成する。中間変数の持ち方(gx/gy/ix/iy/tx/ty)も別に取る。
+#   - 座標規約 x=u*W-0.5, y=v*H-0.5 と clamp 境界は品質契約なので共有する(実装構造
+#     のみ独立にし、数学的定義は同一 — でなければオラクルとして無意味)。
+# ---------------------------------------------------------------------------
+
+
+def _sample_bilinear(image: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """独立バイリニアサンプラ(4 隅重み和・clamp 境界)。
+
+    `image` は `(H, W, C)` か `(H, W)`。`u, v` は同 shape の1次元配列 `(K,)`。
+    戻り値は `(K, C)` または(2D 入力時)`(K,)`。オラクルの基準値・被験値の両方に
+    使う(裁定9 — production の sampler を import しない)。
+    """
+    img = np.asarray(image, dtype=np.float64)
+    squeeze = img.ndim == 2
+    if squeeze:
+        img = img[:, :, np.newaxis]
+    height, width = img.shape[:2]
+    gx = np.asarray(u, dtype=np.float64) * width - 0.5
+    gy = np.asarray(v, dtype=np.float64) * height - 0.5
+    ix = np.floor(gx)
+    iy = np.floor(gy)
+    tx = gx - ix  # [0, 1) 横方向の小数部
+    ty = gy - iy  # [0, 1) 縦方向の小数部
+    col0 = np.clip(ix.astype(np.int64), 0, width - 1)
+    col1 = np.clip(ix.astype(np.int64) + 1, 0, width - 1)
+    row0 = np.clip(iy.astype(np.int64), 0, height - 1)
+    row1 = np.clip(iy.astype(np.int64) + 1, 0, height - 1)
+    # 4 隅の重み(和 = 1)を明示的に組む: (行0,列0)/(行0,列1)/(行1,列0)/(行1,列1)。
+    weights = np.stack(
+        [
+            (1.0 - tx) * (1.0 - ty),
+            tx * (1.0 - ty),
+            (1.0 - tx) * ty,
+            tx * ty,
+        ],
+        axis=-1,
+    )  # (K, 4)
+    corners = np.stack(
+        [img[row0, col0], img[row0, col1], img[row1, col0], img[row1, col1]],
+        axis=1,
+    )  # (K, 4, C)
+    out = np.einsum("kn,knc->kc", weights, corners)
+    return out[:, 0] if squeeze else out
+
+
+def _uniform_barycentric(k: int, seed: int) -> np.ndarray:
+    """三角形一様サンプルの重心座標を sqrt 法で K 点生成する(seed 固定・決定的)。
+
+    r1, r2 ~ U(0,1) に対し s = sqrt(r1) とおくと (1-s, s(1-r2), s r2) が三角形上の
+    面積測度で一様な重心座標になる。全面で同じ K 点集合を使い回す前提(seed 固定)。
+    戻り値 `(K, 3) float64`(各行が (w0, w1, w2)、和 = 1)。
+    """
+    rng = np.random.default_rng(seed)
+    r1 = rng.random(k)
+    r2 = rng.random(k)
+    s = np.sqrt(r1)
+    return np.stack([1.0 - s, s * (1.0 - r2), s * r2], axis=1)
+
+
+@pytest.fixture
+def bilinear_sample() -> Callable[..., np.ndarray]:
+    return _sample_bilinear
+
+
+@pytest.fixture
+def face_barycentric_samples() -> Callable[..., np.ndarray]:
+    return _uniform_barycentric

@@ -9,6 +9,23 @@
 // Codex injection path with `codex exec` before trusting changes here; see
 // Docs/agent-guide/codex-delegation.md.)
 // Fails open (exit 0, no output) on any error.
+//
+// Mode signal: CODEX_MODE=ultra (set by ~/.agent-workflow/codex-ultra.ps1)
+// switches to the fleet-mode policy text. Editing THIS file does not break
+// hook trust — trusted_hash covers hooks.json only. Sessions launched from
+// Codex Desktop do not receive the env signal and get the standard text;
+// both texts are compatible with autonomous delegation by design.
+
+const ULTRA = (process.env.CODEX_MODE || "").toLowerCase() === "ultra";
+
+const ultraContext = [
+  "Atlasmith ULTRA fleet mode (CODEX_MODE=ultra) — outcome gates only:",
+  "- KICKOFF, once: write the standard 5-line declaration EXTENDED with fleet-wide allowed globs and stop conditions; get ONE user approval for the whole package. No per-phase re-declarations after that.",
+  "- CHILDREN carry only 3 rules: stay inside assigned paths; run the verification commands (build/test) and return real output; stop after 2 failures of the same approach and return evidence to the parent. Children never write declarations, never run check-scope, never call ask-advisor.",
+  "- EXIT, once, on the INTEGRATED diff: check-scope.mjs against the kickoff globs; minimality + WHY-comment pass/fail items (review-lenses.md); heavy-artillery only on load-bearing phases. Completion report keeps the 2 mandatory sections (hotspots by risk / needs-human-judgment).",
+  "- Cross-AI second review: run a short connectivity check first; if the partner AI is unreachable, fall back to a fresh-context Codex review and REPORT the fallback (never silently skip).",
+  "- Unchanged: CLAUDE.md/AGENTS.md byte-identical mirror (Stop hook enforces), evidence-not-assertions, main thread does not type implementation source.",
+].join("\n");
 
 const context = [
   "Atlasmith workflow policy (ENFORCED by hooks, not just AGENTS.md):",
@@ -17,14 +34,15 @@ const context = [
   "- Every non-trivial change gets a DOUBLE review: Codex-side first review (impl-reviewer agent, never the author) + a MANDATORY second review by the non-main AI (Claude): `claude -p \"<review brief>\" --model opus --permission-mode plan` (interactive session only — sandboxed codex exec has no network for claude -p; approve out-of-sandbox execution). If unavailable, run a second independent Codex review and REPORT the skipped gate.",
   "- CLAUDE.md and AGENTS.md must stay byte-identical. A Stop hook blocks turn completion while they drift: after editing either, cp over the mirror and diff (must print nothing) before finishing.",
   "- Discipline skills (installed in ~/.codex/skills): invoke $fable-reasoning before any non-trivial phase (recon -> evidence hierarchy -> decomposition -> stop conditions), and $phase-gates before the first file edit of a phase AND before reporting anything as done. Mention them by name — skills do not carry across turns.",
-  "- Consult triggers are CONCRETE (workflow-core/consult-triggers.md): same-signature failure twice, third fix for one symptom, guard block + rewording urge, 2x declared budget, out-of-declaration changes. Window: node ~/.agent-workflow/ask-advisor.mjs <claude|codex> (arg REQUIRED; convention: pick the NON-main AI). Write the 5-line phase declaration (with falsifier + ```scope block) before the first edit; check-scope.mjs verifies it.",
+  "- Consult triggers are CONCRETE (workflow-core/consult-triggers.md) and ORCHESTRATOR-ONLY: same-signature failure twice, third fix for one symptom, guard block + rewording urge, 2x declared budget, out-of-declaration changes. Window: node ~/.agent-workflow/ask-advisor.mjs <claude|codex> (arg REQUIRED; convention: pick the NON-main AI). The 5-line phase declaration (falsifier + ```scope block) is written by the orchestrator, per phase; check-scope.mjs verifies ONCE against the integrated diff. Subagents never write declarations, never run check-scope, never call ask-advisor.",
+  "- Subagent rule (the ONLY discipline delegated agents carry): stay inside assigned paths, run the verification commands and return real output, stop after 2 failures of the same approach and return evidence to the parent.",
   "- Stop conditions: after 2 failures of the same approach, change method or consult the non-main AI — never loop. Escalate after 2x refute/rework.",
   "- Show evidence, not assertions: paste commands and real output.",
   "- Deliberate one-session override (rare, user-approved only): relaunch with env ATLASMITH_ALLOW_DIRECT_EDIT=1.",
 ].join("\n");
 
 try {
-  process.stdout.write(context);
+  process.stdout.write(ULTRA ? ultraContext : context);
 } catch {
   // fail open
 }

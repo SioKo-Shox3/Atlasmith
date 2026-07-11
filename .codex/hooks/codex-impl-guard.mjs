@@ -75,17 +75,11 @@ process.stdin.on("end", () => {
           "type implementation code directly.\n\n" +
           `Refused patch targets: ${blocked.join(", ")}\n\n` +
           "The main session is the ORCHESTRATOR: it plans, integrates, and " +
-          "reviews — implementation is delegated. Do this instead:\n" +
-          "  1. Delegate the change to the implementer subagent (spawn_agent " +
-          "-> .codex/agents/implementer.toml) with the approved plan, allowed " +
-          "write paths, and conventions.\n" +
-          "  2. First review: impl-reviewer agent (never the author). Second " +
-          "review (MANDATORY, non-main AI): interactive session -> " +
-          "`claude -p \"<review brief>\" --model opus --permission-mode plan` " +
-          "(needs out-of-sandbox approval; sandboxed codex exec has no " +
-          "network for claude -p). If unavailable, run a second independent " +
-          "Codex review and REPORT the skipped gate.\n" +
-          "  3. Only then stage + commit.\n\n" +
+          "reviews — implementation is delegated. Hand this change to a " +
+          "subagent (spawn_agent -> .codex/agents/implementer.toml, or the " +
+          "session's own autonomous delegation) with the allowed write " +
+          "paths. Reviews and scope verification happen at the integration " +
+          "point, per AGENTS.md.\n\n" +
           "Do NOT retry this patch on the main thread. Deliberate, " +
           `user-approved override for ONE session: relaunch with env ` +
           `${OVERRIDE_ENV}=1.\n`,

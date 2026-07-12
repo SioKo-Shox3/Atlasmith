@@ -2,6 +2,10 @@
 # Claude 側 .claude/agents/implementer.md と対応。Codex ではこちらが実装の主戦力。
 name = "implementer"
 description = "Execution-focused implementer. Executes a reviewed plan inside its allowed write paths; makes no architectural decisions."
+# playbook割当(Terra帯)。codex-cli 0.144.1のspawn_agentはこの定義を適用しない実測
+# (task_name=名前一致でも子はagent_type=default・親モデル継承)だが、公式スキーマ準拠の
+# 前方互換ピン — CLIがカスタムエージェント選択に対応した時点で自動的に効く。
+model = "gpt-5.6-terra"
 model_reasoning_effort = "high"
 sandbox_mode = "workspace-write"
 developer_instructions = """

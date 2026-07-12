@@ -10,6 +10,16 @@
             "statusMessage": "Atlasmith implementation-routing guard"
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node 'C:/Users/KINGkawamura/Documents/Atlasmith/.codex/hooks/workspace-guard.mjs'; exit $LASTEXITCODE",
+            "statusMessage": "Atlasmith workspace guard"
+          }
+        ]
       }
     ],
     "Stop": [

@@ -114,10 +114,15 @@ Codex メイン時は `.codex/agents/`)とパートナーAIに割り当てる。
 - 調査・機械的作業は最安〜下位。難所は昇格。
 - **品質はモデルの地力だけに頼らない** — 二重レビュー・反証・セルフチェック・多視点分解で構造的に担保する(→ `Docs/agent-guide/orchestration.md`「モデル非依存の品質戦略」)。
 
-## ハーネス強制(文書ではなくフックが守る — Claude がメインのときのみ作動)
+## ハーネス強制(文書ではなくフックが守る)
 
-- `.claude/hooks/enforce-codex-impl.mjs`(PreToolUse)がメインスレッドの実装ソース `Edit`/`Write` を物理的にブロックする。
+- `.claude/hooks/enforce-codex-impl.mjs`(PreToolUse、Claude メイン時)がメインスレッドの実装ソース `Edit`/`Write` を物理的にブロックする。
 - 一時解除(ユーザー承認必須・1セッション限り): `ATLASMITH_ALLOW_DIRECT_EDIT=1` で再起動。
+- **新しい作業ツリーを勝手に作らない**(Codex メイン時は `.codex/hooks/workspace-guard.mjs` が
+  `git worktree add` をブロック — 2026-07-12 新設): 新ツリーは AGENTS.md が分岐時点の旧版・
+  フックはパス単位 trust 未登録で無言全滅する(実測)。隔離が必要ならユーザー承認+
+  ミラー最新化+trust 登録(trust-hooks.mjs)+session_start 発火実証までを同一タスクで。
+  承認済みの一時解除: `ATLASMITH_ALLOW_WORKSPACE=1`。
 - `.claude/settings.local.json` はマシンローカル。別マシンでは `claude-workflow-template/deploy.ps1` で再展開。
 
 ## トークン規律

@@ -11,6 +11,40 @@
 
 import process from "node:process";
 
+// Cadence: 探索期の品質返済(code-gardening+統合一括レビュー)の期限監視。
+// <project>/.harness/cadence.json を読み、超過時だけ1行注入する。失敗したら黙る(fail-open)。
+import { readFileSync as _read } from "node:fs";
+import { execSync as _exec } from "node:child_process";
+import { dirname as _dir, join as _join } from "node:path";
+import { fileURLToPath as _furl } from "node:url";
+function cadenceLine() {
+  try {
+    const root = _join(_dir(_furl(import.meta.url)), "..", "..");
+    const cfg = JSON.parse(_read(_join(root, ".harness", "cadence.json"), "utf8"));
+    const days = Math.floor((Date.now() - Date.parse(cfg.last_gardening.date)) / 86400000);
+    let commits = null;
+    try {
+      commits = Number(
+        _exec(`git rev-list --count ${cfg.last_gardening.commit}..HEAD`, {
+          cwd: root, encoding: "utf8", timeout: 5000, windowsHide: true,
+        }).trim(),
+      );
+    } catch {}
+    const maxD = cfg.max_days ?? 14;
+    const maxC = cfg.max_commits ?? 40;
+    if (days > maxD || (commits !== null && commits > maxC)) {
+      return (
+        `- CADENCE: quality repayment OVERDUE — last code-gardening ${days}d` +
+        (commits !== null ? ` / ${commits} commits` : "") +
+        ` ago (limits ${maxD}d/${maxC}). Schedule code-gardening + ONE integrated review at the next natural boundary, distill one representative task into evals (model-evals.md), then update .harness/cadence.json.`
+      );
+    }
+    return null;
+  } catch {
+    return "- CADENCE: .harness/cadence.json not initialized — create it at the first code-gardening pass ({\"last_gardening\":{\"date\":\"<ISO>\",\"commit\":\"<HEAD>\"},\"max_days\":14,\"max_commits\":40}).";
+  }
+}
+
 const context = [
   "Atlasmith workflow policy (ENFORCED by hooks, not just CLAUDE.md):",
   "- The main session is the ORCHESTRATOR: it splits phases, decides, integrates, and reviews — it does not write implementation itself.",
@@ -28,11 +62,12 @@ const context = [
 ].join("\n");
 
 try {
+  const cad = cadenceLine();
   process.stdout.write(
     JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "SessionStart",
-        additionalContext: context,
+        additionalContext: context + (cad ? "\n" + cad : ""),
       },
     }),
   );

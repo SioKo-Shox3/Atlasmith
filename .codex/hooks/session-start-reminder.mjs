@@ -58,7 +58,7 @@ const ultraContext = [
   "- KICKOFF, once: write the standard 5-line declaration EXTENDED with fleet-wide allowed globs and stop conditions; get ONE user approval for the whole package. No per-phase re-declarations after that.",
   "- CHILDREN carry only 3 rules: stay inside assigned paths; run the verification commands (build/test) and return real output; stop after 2 failures of the same approach and return evidence to the parent. Children never write declarations, never run check-scope, never call ask-advisor.",
   "- EXIT, once, on the INTEGRATED diff: check-scope.mjs against the kickoff globs; minimality + WHY-comment pass/fail items (review-lenses.md); heavy-artillery only on load-bearing phases. Completion report keeps the 2 mandatory sections (hotspots by risk / needs-human-judgment).",
-  "- Cross-AI second review: run a short connectivity check first; if the partner AI is unreachable, fall back to a fresh-context Codex review and REPORT the fallback (never silently skip).",
+  "- Cross-AI second review: run a short connectivity check first; if the partner AI is unreachable, fall back to a fresh-context Codex review and REPORT the fallback (never silently skip). CONVERGENCE: max 2 review rounds — findings classified blocking/non-blocking, only blocking requires fixes, round 2 verifies ONLY the fix-diff (new findings accepted only if blocking). NO round 3: leftovers are logged as 残課題 and routed to the repayment cycle. Never loop review↔fix.",
   "- Unchanged: CLAUDE.md/AGENTS.md byte-identical mirror (Stop hook enforces), evidence-not-assertions, main thread does not type implementation source.",
 ].join("\n");
 

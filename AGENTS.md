@@ -152,6 +152,9 @@ Codex メイン時は `.codex/agents/`)とパートナーAIに割り当てる。
 
 - ゲートのコマンドと「Done」の条件: `Docs/agent-guide/build-and-verify.md`。変更に関係するゲートだけ実行し、どれを実行したか明示する。
 - コミット: 1コミット=1論理変更、日本語・命令形、対象と意図がわかる件名。詳細: `Docs/agent-guide/branching-and-commits.md`(なければ本節のみ)。
+- **マージ後の片付けまでが完了条件(2026-07-13 新設)**: 統合が済んだら、全量マージ済みの
+  ブランチ(`git branch --merged` で確認)と役目を終えた worktree(clean を確認して
+  `git worktree remove`)を削除する。**未マージ・dirty・使用中のものは触らず報告する。**
 
 ## 参照マップ(`Docs/agent-guide/`)
 

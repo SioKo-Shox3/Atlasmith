@@ -52,7 +52,7 @@ import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, rmSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 const OVERRIDE_ENV = "ATLASMITH_ALLOW_TRACKED_IGNORED";
@@ -62,39 +62,57 @@ const sha = (s) => createHash("sha256").update(s).digest("hex");
 
 // ブレーキ2: 同じ違反集合を二度は突きつけない(OS temp のマーカー)。
 // 失敗は握りつぶす — マーカーが読めない/書けないだけでガードを壊さない。
-function markerPath(root) {
-  return join(tmpdir(), `ignored-tracked-guard-${sha(root).slice(0, 16)}.marker`);
+//
+// マーカーは **リポジトリ×セッション** 単位に分ける。1リポジトリ1スロットにすると、
+// 同じリポジトリで2セッションが並行したとき互いのfingerprintを上書きし合い、
+// どちらも抑止されずループブレーキが破れる(実測ではなくレビュー指摘 2026-07-25)。
+const markerPrefix = (root) => `ignored-tracked-guard-${sha(root).slice(0, 16)}-`;
+function markerPath(root, sessionKey) {
+  return join(tmpdir(), `${markerPrefix(root)}${sha(sessionKey).slice(0, 16)}.marker`);
 }
-function alreadyReported(root, fingerprint) {
+function alreadyReported(root, sessionKey, fingerprint) {
   try {
-    return readFileSync(markerPath(root), "utf8").trim() === fingerprint;
+    return readFileSync(markerPath(root, sessionKey), "utf8").trim() === fingerprint;
   } catch {
     return false;
   }
 }
-function rememberReported(root, fingerprint) {
+function rememberReported(root, sessionKey, fingerprint) {
   try {
-    writeFileSync(markerPath(root), fingerprint);
+    writeFileSync(markerPath(root, sessionKey), fingerprint);
   } catch {
     /* ignore */
   }
 }
-// 違反が解消したらマーカーを消して再武装する。これが無いと、いったん報告した
-// 違反集合は「解消 → 同じ集合が再発」しても永久に黙ってしまう(= ガードが静かに
-// 無効化される最悪の壊れ方)。
+// 違反が解消したら、このリポジトリの **全セッション分** のマーカーを消して再武装する。
+// これが無いと、いったん報告した違反集合は「解消 → 同じ集合が再発」しても黙ったまま
+// になる(= ガードが静かに無効化される最悪の壊れ方)。解消は全セッションに共通の
+// 事実なので、他セッション分も一緒に消すのが正しい。
 function forgetReported(root) {
+  const prefix = markerPrefix(root);
   try {
-    rmSync(markerPath(root));
+    for (const f of readdirSync(tmpdir())) {
+      if (f.startsWith(prefix)) {
+        try {
+          rmSync(join(tmpdir(), f));
+        } catch {
+          /* ignore */
+        }
+      }
+    }
   } catch {
-    /* ignore: 存在しなければそれでよい */
+    /* ignore */
   }
 }
 
 function main(payload) {
   if (/^(1|true|yes|on)$/i.test(process.env[OVERRIDE_ENV] || "")) return;
 
-  // ブレーキ1: この継続自体が stop hook に強制されたものなら、二度は止めない。
-  if (payload && payload.stop_hook_active) return;
+  // 注意: ブレーキ1(stop_hook_active)は **git 検査のあと** に効かせる。
+  // 先に return してしまうと、最も普通の解消経路 —「ブロック → 指摘どおり修正 →
+  // 再 Stop(このとき stop_hook_active が立つ)」— でマーカーが消えず、
+  // 再武装が働かない(レビュー指摘 2026-07-25)。ブレーキ1が抑えるのは
+  // 「もう一度止めること」だけで、状態の観測と後片付けは常に行う。
 
   // フック自身の位置からリポジトリ根を導く(cwd に依存しない —
   // 子プロセスや別 cwd から呼ばれても同じ判定になるように)。
@@ -113,20 +131,25 @@ function main(payload) {
 
   const files = out.split("\n").map((s) => s.trim()).filter(Boolean);
   if (files.length === 0) {
-    forgetReported(root); // 解消したので再武装(再発時にまた promptできるように)
+    // 解消 → 全セッション分のマーカーを消して再武装。stop_hook_active の有無に
+    // かかわらずここを通す(上の注意書き参照)。
+    forgetReported(root);
     return;
   }
 
+  // ブレーキ1: この継続自体が stop hook に強制されたものなら、二度は止めない。
+  // (後片付けは上で済ませてある)
+  if (payload && payload.stop_hook_active) return;
+
   // ブレーキ2: 同一の違反集合を既に報告済みなら黙る(集合が変われば再度促す)。
-  // セッション識別子を混ぜる: 新しいセッションは同じ違反でも1度は知らされるべき
-  // (マーカーはOS temp上に残り、セッションを跨いで生き残るため)。
-  // 識別子が取れないホストでは従来どおりリポジトリ単位の抑止に縮退する。
+  // マーカーはリポジトリ×セッション単位。識別子が取れないホストでは空文字となり、
+  // そのホスト内では従来どおりリポジトリ単位の抑止に縮退する。
   const sessionKey = String(
     (payload && (payload.session_id || payload.sessionId || payload.thread_id)) || "",
   );
-  const fingerprint = sha(sessionKey + "\n" + files.slice().sort().join("\n"));
-  if (alreadyReported(root, fingerprint)) return;
-  rememberReported(root, fingerprint);
+  const fingerprint = sha(files.slice().sort().join("\n"));
+  if (alreadyReported(root, sessionKey, fingerprint)) return;
+  rememberReported(root, sessionKey, fingerprint);
 
   const shown = files.slice(0, MAX_LISTED);
   const rest = files.length - shown.length;

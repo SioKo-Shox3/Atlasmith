@@ -2,9 +2,10 @@
 # Claude 側 .claude/agents/researcher.md と対応。知識は AGENTS.md + Docs/agent-guide/ が単一ソース。
 name = "researcher"
 description = "Read-only investigation of code, dependencies, and conventions. Returns a focused summary so broad exploration never pollutes the orchestrator context."
-# playbook割当(Terra帯)。codex-cli 0.144.1のspawn_agentはこの定義を適用しない実測
-# (task_name=名前一致でも子はagent_type=default・親モデル継承)だが、公式スキーマ準拠の
-# 前方互換ピン — CLIがカスタムエージェント選択に対応した時点で自動的に効く。
+# playbook割当。codex-cli 0.145.0 で spawn_agent が agent_type/model/reasoning_effort を
+# 受け付け、agent_type=<このファイル名> でこの定義(developer_instructions)が実際に子へ
+# 適用されることを実測済み(2026-07-25)。0.144.1 の「子は常に親モデル継承・default役割」は解消。
+# ただし toml の model= が spawn 時に採用されるかは未実測 — 親は spawn 時に model を明示すること。
 model = "gpt-5.6-terra"
 model_reasoning_effort = "medium"
 sandbox_mode = "read-only"

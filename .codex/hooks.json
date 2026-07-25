@@ -20,16 +20,6 @@
             "statusMessage": "Atlasmith workspace guard"
           }
         ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node 'C:/Users/KINGkawamura/Documents/Atlasmith/.codex/hooks/gitignore-guard.mjs'; exit $LASTEXITCODE",
-            "statusMessage": "Atlasmith gitignore guard"
-          }
-        ]
       }
     ],
     "Stop": [
@@ -39,6 +29,15 @@
             "type": "command",
             "command": "node 'C:/Users/KINGkawamura/Documents/Atlasmith/.codex/hooks/mirror-guard.mjs'; exit $LASTEXITCODE",
             "statusMessage": "CLAUDE.md/AGENTS.md mirror guard"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node 'C:/Users/KINGkawamura/Documents/Atlasmith/.codex/hooks/ignored-tracked-guard.mjs'; exit $LASTEXITCODE",
+            "statusMessage": "Atlasmith ignored-tracked guard"
           }
         ]
       }

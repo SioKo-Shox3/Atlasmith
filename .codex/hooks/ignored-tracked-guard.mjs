@@ -18,6 +18,31 @@
 // weakness: it cannot be reworded around, and it stays silent unless the
 // repository is actually in the bad state.
 //
+// WIRED FROM BOTH CLIs — this file is the single implementation:
+//   Codex main : .codex/hooks.json           → Stop
+//   Claude main: .claude/settings.local.json → Stop  (points at THIS path,
+//                i.e. `node .codex/hooks/ignored-tracked-guard.mjs`)
+// It lives under .codex/ only for historical reasons; the check itself is
+// CLI-agnostic (it reads git state, nothing else). Do NOT "fix" this by
+// copying it into .claude/hooks/ — a second copy is exactly how mirror-guard
+// style duplicates drift apart. A guard wired on only one side is worse than
+// no guard, because it reads as covered (measured 2026-07-25: the first
+// version of this guard shipped Codex-only and a stop-time review caught it).
+//
+// ONE NUDGE, THEN LET GO. A Stop hook that keeps blocking can make a session
+// impossible to end — a stop-hook feedback loop already wrecked a session once
+// in this harness (see failure taxonomy; mirror-guard carries the same brake).
+// Unlike the mirror drift, this condition is NOT always fixable by the agent:
+// untracking a file may be exactly the decision that belongs to the user. So
+// the guard nudges once and then steps aside:
+//   brake 1 — `stop_hook_active`: this continuation was already forced by a
+//             stop hook, so do not force another one.
+//   brake 2 — fingerprint marker (OS temp, keyed by repo path): if the exact
+//             same set of offending files was already reported, stay silent.
+//             A CHANGED set means new information, so it may nudge again.
+// Brake 2 exists because brake 1 depends on a field the host may not send;
+// a guard that can hang a session must not rely on a single mechanism.
+//
 // Blocks turn completion while the condition holds. Fails OPEN on any error
 // (not a repo, git missing, timeout) — a guard bug must never wedge a session.
 // Approved override for ONE session: set ATLASMITH_ALLOW_TRACKED_IGNORED=1.
@@ -26,12 +51,40 @@ import process from "node:process";
 import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 const OVERRIDE_ENV = "ATLASMITH_ALLOW_TRACKED_IGNORED";
 const MAX_LISTED = 15;
 
-function main() {
+const sha = (s) => createHash("sha256").update(s).digest("hex");
+
+// ブレーキ2: 同じ違反集合を二度は突きつけない(OS temp のマーカー)。
+// 失敗は握りつぶす — マーカーが読めない/書けないだけでガードを壊さない。
+function markerPath(root) {
+  return join(tmpdir(), `ignored-tracked-guard-${sha(root).slice(0, 16)}.marker`);
+}
+function alreadyReported(root, fingerprint) {
+  try {
+    return readFileSync(markerPath(root), "utf8").trim() === fingerprint;
+  } catch {
+    return false;
+  }
+}
+function rememberReported(root, fingerprint) {
+  try {
+    writeFileSync(markerPath(root), fingerprint);
+  } catch {
+    /* ignore */
+  }
+}
+
+function main(payload) {
   if (/^(1|true|yes|on)$/i.test(process.env[OVERRIDE_ENV] || "")) return;
+
+  // ブレーキ1: この継続自体が stop hook に強制されたものなら、二度は止めない。
+  if (payload && payload.stop_hook_active) return;
 
   // フック自身の位置からリポジトリ根を導く(cwd に依存しない —
   // 子プロセスや別 cwd から呼ばれても同じ判定になるように)。
@@ -50,6 +103,11 @@ function main() {
 
   const files = out.split("\n").map((s) => s.trim()).filter(Boolean);
   if (files.length === 0) return;
+
+  // ブレーキ2: 同一の違反集合を既に報告済みなら黙る(集合が変われば再度促す)。
+  const fingerprint = sha(files.slice().sort().join("\n"));
+  if (alreadyReported(root, fingerprint)) return;
+  rememberReported(root, fingerprint);
 
   const shown = files.slice(0, MAX_LISTED);
   const rest = files.length - shown.length;
@@ -77,9 +135,25 @@ function main() {
   process.exit(2);
 }
 
-try {
-  main();
-} catch {
-  // fail open
-}
-process.exit(0);
+// stdin から Stop フックのペイロードを読む(stop_hook_active を見るため)。
+// stdin が来ない環境でも固まらないよう、'end' が来なければ空扱いで進む。
+let raw = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  raw += chunk;
+});
+process.stdin.on("end", () => {
+  try {
+    let payload = {};
+    try {
+      payload = JSON.parse(raw || "{}");
+    } catch {
+      payload = {};
+    }
+    main(payload);
+  } catch {
+    // fail open
+  }
+  process.exit(0);
+});
+process.stdin.on("error", () => process.exit(0));

@@ -52,7 +52,7 @@ import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 const OVERRIDE_ENV = "ATLASMITH_ALLOW_TRACKED_IGNORED";
@@ -79,6 +79,16 @@ function rememberReported(root, fingerprint) {
     /* ignore */
   }
 }
+// 違反が解消したらマーカーを消して再武装する。これが無いと、いったん報告した
+// 違反集合は「解消 → 同じ集合が再発」しても永久に黙ってしまう(= ガードが静かに
+// 無効化される最悪の壊れ方)。
+function forgetReported(root) {
+  try {
+    rmSync(markerPath(root));
+  } catch {
+    /* ignore: 存在しなければそれでよい */
+  }
+}
 
 function main(payload) {
   if (/^(1|true|yes|on)$/i.test(process.env[OVERRIDE_ENV] || "")) return;
@@ -102,10 +112,19 @@ function main(payload) {
   }
 
   const files = out.split("\n").map((s) => s.trim()).filter(Boolean);
-  if (files.length === 0) return;
+  if (files.length === 0) {
+    forgetReported(root); // 解消したので再武装(再発時にまた promptできるように)
+    return;
+  }
 
   // ブレーキ2: 同一の違反集合を既に報告済みなら黙る(集合が変われば再度促す)。
-  const fingerprint = sha(files.slice().sort().join("\n"));
+  // セッション識別子を混ぜる: 新しいセッションは同じ違反でも1度は知らされるべき
+  // (マーカーはOS temp上に残り、セッションを跨いで生き残るため)。
+  // 識別子が取れないホストでは従来どおりリポジトリ単位の抑止に縮退する。
+  const sessionKey = String(
+    (payload && (payload.session_id || payload.sessionId || payload.thread_id)) || "",
+  );
+  const fingerprint = sha(sessionKey + "\n" + files.slice().sort().join("\n"));
   if (alreadyReported(root, fingerprint)) return;
   rememberReported(root, fingerprint);
 

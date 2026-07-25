@@ -29,19 +29,21 @@
 // no guard, because it reads as covered (measured 2026-07-25: the first
 // version of this guard shipped Codex-only and a stop-time review caught it).
 //
-// ONE NUDGE, THEN LET GO. A Stop hook that keeps blocking can make a session
+// BOUNDED NUDGING. A Stop hook that keeps blocking can make a session
 // impossible to end — a stop-hook feedback loop already wrecked a session once
-// in this harness (see failure taxonomy; mirror-guard carries the same brake).
-// Unlike the mirror drift, this condition is NOT always fixable by the agent:
-// untracking a file may be exactly the decision that belongs to the user. So
-// the guard nudges once and then steps aside:
-//   brake 1 — `stop_hook_active`: this continuation was already forced by a
-//             stop hook, so do not force another one.
-//   brake 2 — fingerprint marker (OS temp, keyed by repo path): if the exact
-//             same set of offending files was already reported, stay silent.
-//             A CHANGED set means new information, so it may nudge again.
-// Brake 2 exists because brake 1 depends on a field the host may not send;
-// a guard that can hang a session must not rely on a single mechanism.
+// in this harness (see failure taxonomy). Unlike mirror drift, this condition
+// is NOT always fixable by the agent: untracking a file may be exactly the
+// decision that belongs to the user. So the guard is bounded by its OWN
+// counter, held in a per-repo × per-session marker (OS temp):
+//   - same offending file set as last reported → stay silent
+//   - set CHANGED → new information, nudge again
+//   - already nudged MAX_NUDGES times this session → stay silent for good
+//   - offending set became empty → delete every marker for this repo, so the
+//     guard re-arms and a recurrence is caught again
+// Deliberately NOT using `stop_hook_active`: that flag says "SOME stop hook
+// forced this continuation", not "I did". Suppressing on it makes this guard
+// blind to a NEW violation that appears while another guard (e.g. mirror-guard)
+// is driving the continuation — measured as a review finding, 2026-07-25.
 //
 // Blocks turn completion while the condition holds. Fails OPEN on any error
 // (not a repo, git missing, timeout) — a guard bug must never wedge a session.
@@ -57,6 +59,9 @@ import { tmpdir } from "node:os";
 
 const OVERRIDE_ENV = "ATLASMITH_ALLOW_TRACKED_IGNORED";
 const MAX_LISTED = 15;
+// 1セッションで継続を強制する上限。違反集合が変わり続けても、ここで必ず打ち止めに
+// なるので、セッションが終了不能になることはない。
+const MAX_NUDGES = 3;
 
 const sha = (s) => createHash("sha256").update(s).digest("hex");
 
@@ -70,16 +75,18 @@ const markerPrefix = (root) => `ignored-tracked-guard-${sha(root).slice(0, 16)}-
 function markerPath(root, sessionKey) {
   return join(tmpdir(), `${markerPrefix(root)}${sha(sessionKey).slice(0, 16)}.marker`);
 }
-function alreadyReported(root, sessionKey, fingerprint) {
+// マーカーは {n: これまでに鳴らした回数, f: 直近に報告した違反集合} を持つ。
+function readMarker(root, sessionKey) {
   try {
-    return readFileSync(markerPath(root, sessionKey), "utf8").trim() === fingerprint;
+    const m = JSON.parse(readFileSync(markerPath(root, sessionKey), "utf8"));
+    return { n: Number(m.n) || 0, f: String(m.f || "") };
   } catch {
-    return false;
+    return { n: 0, f: "" };
   }
 }
-function rememberReported(root, sessionKey, fingerprint) {
+function writeMarker(root, sessionKey, marker) {
   try {
-    writeFileSync(markerPath(root, sessionKey), fingerprint);
+    writeFileSync(markerPath(root, sessionKey), JSON.stringify(marker));
   } catch {
     /* ignore */
   }
@@ -108,11 +115,11 @@ function forgetReported(root) {
 function main(payload) {
   if (/^(1|true|yes|on)$/i.test(process.env[OVERRIDE_ENV] || "")) return;
 
-  // 注意: ブレーキ1(stop_hook_active)は **git 検査のあと** に効かせる。
-  // 先に return してしまうと、最も普通の解消経路 —「ブロック → 指摘どおり修正 →
-  // 再 Stop(このとき stop_hook_active が立つ)」— でマーカーが消えず、
-  // 再武装が働かない(レビュー指摘 2026-07-25)。ブレーキ1が抑えるのは
-  // 「もう一度止めること」だけで、状態の観測と後片付けは常に行う。
+  // `stop_hook_active` は使わない(レビュー指摘 2026-07-25)。このフラグが意味するのは
+  // 「**どれかの** Stop フックが継続を強制した」であって「自分が鳴らした」ではない。
+  // これで自分の検査を抑止すると、例えば mirror-guard が継続を強制している最中に
+  // 起きた **新規の違反を丸ごと見逃す**。ループ安全は、自分が鳴らした回数そのものを
+  // 数えることで担保する(下の nudge 上限)— 他人の継続に相乗りして黙らない。
 
   // フック自身の位置からリポジトリ根を導く(cwd に依存しない —
   // 子プロセスや別 cwd から呼ばれても同じ判定になるように)。
@@ -137,19 +144,21 @@ function main(payload) {
     return;
   }
 
-  // ブレーキ1: この継続自体が stop hook に強制されたものなら、二度は止めない。
-  // (後片付けは上で済ませてある)
-  if (payload && payload.stop_hook_active) return;
-
-  // ブレーキ2: 同一の違反集合を既に報告済みなら黙る(集合が変われば再度促す)。
-  // マーカーはリポジトリ×セッション単位。識別子が取れないホストでは空文字となり、
-  // そのホスト内では従来どおりリポジトリ単位の抑止に縮退する。
+  // ブレーキ: マーカーはリポジトリ×セッション単位(識別子が取れないホストでは
+  // 空文字となり、そのホスト内ではリポジトリ単位の抑止に縮退する)。
   const sessionKey = String(
     (payload && (payload.session_id || payload.sessionId || payload.thread_id)) || "",
   );
   const fingerprint = sha(files.slice().sort().join("\n"));
-  if (alreadyReported(root, sessionKey, fingerprint)) return;
-  rememberReported(root, sessionKey, fingerprint);
+  const marker = readMarker(root, sessionKey);
+
+  // (a) 同じ違反集合は二度突きつけない。集合が変われば新しい情報なので promptする。
+  if (marker.f === fingerprint) return;
+  // (b) 回数上限: 集合が変わり続けても、1セッションで鳴らすのは MAX_NUDGES 回まで。
+  //     これがセッションを停止不能にしないための絶対的な歯止め(他人の継続に
+  //     依存しない自前のカウンタなので、上の stop_hook_active 問題を持ち込まない)。
+  if (marker.n >= MAX_NUDGES) return;
+  writeMarker(root, sessionKey, { n: marker.n + 1, f: fingerprint });
 
   const shown = files.slice(0, MAX_LISTED);
   const rest = files.length - shown.length;

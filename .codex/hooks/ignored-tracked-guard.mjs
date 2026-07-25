@@ -40,6 +40,10 @@
 //   - already nudged MAX_NUDGES times this session → stay silent for good
 //   - offending set became empty → delete every marker for this repo, so the
 //     guard re-arms and a recurrence is caught again
+//   - the counter cannot be persisted (temp unwritable) → do NOT block at all.
+//     A guard that cannot guarantee it will stop nudging must not start:
+//     without a durable counter every Stop looks like the first one, and the
+//     session can never end (review finding, 2026-07-25).
 // Deliberately NOT using `stop_hook_active`: that flag says "SOME stop hook
 // forced this continuation", not "I did". Suppressing on it makes this guard
 // blind to a NEW violation that appears while another guard (e.g. mirror-guard)
@@ -84,11 +88,15 @@ function readMarker(root, sessionKey) {
     return { n: 0, f: "" };
   }
 }
+// 書けたことを **読み戻して** 確認する。戻り値 false は「カウンタを永続化できない」
+// = 抑止機構が働かないという意味で、そのときは絶対にブロックしない(下記参照)。
 function writeMarker(root, sessionKey, marker) {
+  const body = JSON.stringify(marker);
   try {
-    writeFileSync(markerPath(root, sessionKey), JSON.stringify(marker));
+    writeFileSync(markerPath(root, sessionKey), body);
+    return readFileSync(markerPath(root, sessionKey), "utf8") === body;
   } catch {
-    /* ignore */
+    return false;
   }
 }
 // 違反が解消したら、このリポジトリの **全セッション分** のマーカーを消して再武装する。
@@ -99,9 +107,16 @@ function forgetReported(root) {
   const prefix = markerPrefix(root);
   try {
     for (const f of readdirSync(tmpdir())) {
-      if (f.startsWith(prefix)) {
+      if (!f.startsWith(prefix)) continue;
+      const p = join(tmpdir(), f);
+      try {
+        rmSync(p);
+      } catch {
+        // 削除できない環境でも再武装は必要なので、初期状態を上書きして代替する。
+        // これも失敗したら、そのマーカーは「同一集合の再発を見逃す」状態で残る —
+        // 止まらなくなるより安全側の劣化なので、ここは黙って続行する。
         try {
-          rmSync(join(tmpdir(), f));
+          writeFileSync(p, JSON.stringify({ n: 0, f: "" }));
         } catch {
           /* ignore */
         }
@@ -158,7 +173,11 @@ function main(payload) {
   //     これがセッションを停止不能にしないための絶対的な歯止め(他人の継続に
   //     依存しない自前のカウンタなので、上の stop_hook_active 問題を持ち込まない)。
   if (marker.n >= MAX_NUDGES) return;
-  writeMarker(root, sessionKey, { n: marker.n + 1, f: fingerprint });
+  // (c) カウンタを永続化できないなら **止めない**。書込みが失敗するとカウンタが
+  //     進まず、毎回「初回の nudge」と判定して無限に再ブロックする — カウンタで
+  //     防ぐはずだった停止不能を、カウンタの故障そのものが引き起こす
+  //     (レビュー指摘 2026-07-25)。抑止を保証できない限りブロックしない。
+  if (!writeMarker(root, sessionKey, { n: marker.n + 1, f: fingerprint })) return;
 
   const shown = files.slice(0, MAX_LISTED);
   const rest = files.length - shown.length;

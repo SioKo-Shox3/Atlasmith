@@ -20,6 +20,16 @@
             "statusMessage": "Atlasmith workspace guard"
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node 'C:/Users/KINGkawamura/Documents/Atlasmith/.codex/hooks/gitignore-guard.mjs'; exit $LASTEXITCODE",
+            "statusMessage": "Atlasmith gitignore guard"
+          }
+        ]
       }
     ],
     "Stop": [

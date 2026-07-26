@@ -22,7 +22,7 @@ const ULTRA = (process.env.CODEX_MODE || "").toLowerCase() === "ultra";
 // <project>/.harness/cadence.json {last_gardening:{date,commit}, max_days, max_commits} を読み、
 // 超過時だけ1行注入する。ファイル読取もgitも失敗したら黙る(fail-open)。
 import { readFileSync as _read } from "node:fs";
-import { execSync as _exec } from "node:child_process";
+import { execFileSync as _execFile } from "node:child_process";
 import { dirname as _dir, join as _join } from "node:path";
 import { fileURLToPath as _furl } from "node:url";
 function cadenceLine() {
@@ -32,11 +32,18 @@ function cadenceLine() {
     const days = Math.floor((Date.now() - Date.parse(cfg.last_gardening.date)) / 86400000);
     let commits = null;
     try {
-      commits = Number(
-        _exec(`git rev-list --count ${cfg.last_gardening.commit}..HEAD`, {
-          cwd: root, encoding: "utf8", timeout: 5000, windowsHide: true,
-        }).trim(),
-      );
+      // cadence.json is repo-local (untrusted) input: never hand its values to a
+      // shell, and accept only a hex commit id so the value cannot become a git
+      // option or range expression. Invalid value => commits stays null and the
+      // days-only check still applies.
+      const commit = String(cfg.last_gardening.commit || "");
+      if (/^[0-9a-f]{7,40}$/i.test(commit)) {
+        commits = Number(
+          _execFile("git", ["rev-list", "--count", `${commit}..HEAD`], {
+            cwd: root, encoding: "utf8", timeout: 5000, windowsHide: true,
+          }).trim(),
+        );
+      }
     } catch {}
     const maxD = cfg.max_days ?? 14;
     const maxC = cfg.max_commits ?? 40;

@@ -115,6 +115,14 @@ Codex が担い、Claude は planner 相談(`claude -p --permission-mode plan`)�
 - レビュー往復回数・トリアージ既定(LIGHT/STANDARD/HEAVY の運用閾値)
 - 委譲粒度(1子に渡すタスクの大きさ)
 
+**実装場所(2026-07-26)**: 切り替えは Claude 側 SessionStart フック
+(`.claude/hooks/session-start-reminder.mjs`)が行う。SessionStart ペイロードの `model` で
+プロファイルを選び、**選んだ名前を必ず出力する** — 検出できたかどうかがセッション冒頭で見える。
+`model` を返さないホストや未知のモデルは `default` へ落ちる(未知のモデルに緩い規則を渡さない
+安全側)。試運転・意図的な指定は `CLAUDE_MODEL_PROFILE=<name>` で上書きできる。
+不変層の行はプロファイルに関わらず常に出力され、**差し替わるのは調整層の行だけ**。
+Codex 側は GPT 系のため対象外(既存の `CODEX_MODE` 分岐がその役割を担う)。
+
 ### プロファイル: Opus 5(2026-07-26 更新 — 【一次資料】で裏どり済み)
 
 出典: Anthropic 公式「Prompting Claude Opus 5」

@@ -470,3 +470,227 @@ def bilinear_sample() -> Callable[..., np.ndarray]:
 @pytest.fixture
 def face_barycentric_samples() -> Callable[..., np.ndarray]:
     return _uniform_barycentric
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Step 2-2 部位分割 fixture
+#
+# 既存の fixture / ヘルパ / 定数は 1 行も変更していない(追加のみ)。
+#
+# `cube_mesh` の weld 隣接構造(テストが明示的に assert する数値の導出根拠):
+#   - 位置weld 後の相異なる頂点は **8**(24 頂点は 6 面 x 4 corner の複製で、
+#     立方体の頂点1個につき 3 面ぶんのコピーがある: 8 x 3 = 24)。
+#   - 辺数 **E == 18**: 閉じた三角形メッシュのオイラー標数 V - E + F = 2 に
+#     V=8, F=12 を代入すると E = 18。内訳は立方体の稜線 12 本 + 各 facet を
+#     2 三角形に割る対角線 6 本。
+#   - `two_cubes_mesh` の 2 つの立方体は x 方向に 3.0 離れており位置を共有しない
+#     ため、**立方体間の辺は 0 本**(全 36 本 = 18 + 18 がそれぞれの立方体に閉じる)。
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def two_cubes_mesh() -> MeshData:
+    """互いに離れた 2 個の立方体(48 頂点 / 24 面)を 1 メッシュに連結したもの。
+
+    2 個目は `(3.0, 0.0, 0.0)` 平行移動。UV は 1 個目を u 方向 [0, 0.5]、2 個目を
+    [0.5, 1.0] へ収めた解析 UV(`_build_cube_geometry` の面別パッチを u だけ
+    半分に縮めて左右へ振り分ける)。
+
+    **用途は「連結成分の分離」ゲート専用**(計画v4 §5 Step 2-2 / BL-1)。非連結
+    なので多視点融合ゲートには使わない。
+    """
+    vertices, faces, uv = _build_cube_geometry()
+    n_vertices = len(vertices)
+    all_vertices = np.concatenate(
+        [vertices, vertices + np.array([3.0, 0.0, 0.0])], axis=0
+    )
+    all_faces = np.concatenate([faces, faces + n_vertices], axis=0)
+    uv_left = uv.copy()
+    uv_left[:, 0] = uv[:, 0] * 0.5
+    uv_right = uv.copy()
+    uv_right[:, 0] = 0.5 + uv[:, 0] * 0.5
+    all_uv = np.concatenate([uv_left, uv_right], axis=0).astype(np.float32)
+    return MeshData(
+        vertices=all_vertices,
+        faces=all_faces,
+        uv=all_uv,
+        maps={},
+        source_vertex=np.arange(len(all_vertices), dtype=np.int64),
+    )
+
+
+# UV パッチの内側マージン(パッチ寸法に対する比)。既存 `_build_cube_geometry`
+# (:34)と同じ 10%。領域どうしが辺を共有していると、Step 2-6/2-7 の焼き直し
+# オラクルでその直線上だけバイリニア滲みが起き、原因の切り分けが難しい形で PSNR が
+# 落ちる。fixture 側で最初から領域を離しておく。
+_UV_PATCH_INSET = 0.1
+
+
+def _place_in_patch(
+    s: np.ndarray, t: np.ndarray, rect: tuple[float, float, float, float]
+) -> tuple[np.ndarray, np.ndarray]:
+    """`[0,1]^2` の (s, t) を矩形 `rect=(u0, u1, v0, v1)` の内側 10% へ写す。"""
+    u0, u1, v0, v1 = rect
+    margin_u = (u1 - u0) * _UV_PATCH_INSET
+    margin_v = (v1 - v0) * _UV_PATCH_INSET
+    return (
+        u0 + margin_u + s * (u1 - u0 - 2.0 * margin_u),
+        v0 + margin_v + t * (v1 - v0 - 2.0 * margin_v),
+    )
+
+
+# 円筒 fixture の UV 領域(インセット前の外枠)。3 領域は辺を共有しない。
+_CYLINDER_UV_RECTS = {
+    "side": (0.0, 1.0, 0.0, 0.5),
+    "top": (0.0, 0.5, 0.5, 1.0),
+    "bottom": (0.5, 1.0, 0.5, 1.0),
+}
+
+
+def _build_capped_cylinder_geometry() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """`trimesh.creation.cylinder(radius=0.5, height=2.0, sections=32)` + 解析 UV。
+
+    UV レイアウト(3 領域。各領域は `_UV_PATCH_INSET` ぶん内側へ寄せてあるので、
+    領域どうしは辺も点も共有しない):
+      側面        外枠 u [0, 1]   / v [0, 0.5]  — u = 展開角 / 2pi、v = 上端 → 下端
+      +Z キャップ 外枠 u [0, 0.5] / v [0.5, 1]  — 円盤の平面 UV
+      -Z キャップ 外枠 u [0.5, 1] / v [0.5, 1]  — 同上(x を反転 = 下から見た向き)
+
+    **面ごとに頂点をアンロールする(3M 頂点)WHY**: 側面の円筒展開とキャップの
+    円盤 UV は rim 頂点に別々の UV を要求し、頂点あたり 1 組の UV では両立
+    しない(円筒展開の theta=0/2pi シームも同様)。glTF が UV シームで頂点を
+    複製するのと同じ事情なので、fixture 側でも複製で表現する。位置は trimesh の
+    出力行をそのままコピーするだけなので、位置weld は元の 66 頂点へビット厳密に
+    畳み戻る — weld を前提とした隣接構築(`segmentation/adjacency.py`)の実地の
+    対照でもある。
+    """
+    radius, height, sections = 0.5, 2.0, 32
+    cylinder = trimesh.creation.cylinder(
+        radius=radius, height=height, sections=sections
+    )
+    # trimesh 側の三角形化が変わると 66 / 384 / 128 / 192 を assert する 4 本の
+    # テストが同時に意味不明な数値で落ちるので、ここで位相を1行に固定して切り分ける
+    # (`pyproject.toml` の `trimesh>=4.12.2` に上限が無いため)。
+    if len(cylinder.vertices) != 66 or len(cylinder.faces) != 128:
+        raise ValueError(
+            "capped cylinder fixture assumes trimesh emits 66 vertices / 128 faces "
+            f"for sections=32, got {len(cylinder.vertices)} / {len(cylinder.faces)}"
+        )
+    base_vertices = np.asarray(cylinder.vertices, dtype=np.float64)
+    base_faces = np.asarray(cylinder.faces, dtype=np.int64)
+    corners = base_vertices[base_faces]  # (M, 3, 3)
+
+    normals = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+    normals /= np.linalg.norm(normals, axis=1, keepdims=True)
+    axis_dot = normals[:, 2]
+    is_top = axis_dot >= 0.5
+    is_bottom = axis_dot <= -0.5
+    is_side = ~(is_top | is_bottom)
+    if int(is_top.sum()) == 0 or int(is_bottom.sum()) == 0 or int(is_side.sum()) == 0:
+        raise ValueError(
+            "capped cylinder fixture expects top/bottom/side faces, got "
+            f"{int(is_top.sum())}/{int(is_bottom.sum())}/{int(is_side.sum())}"
+        )
+
+    uv = np.zeros((len(base_faces), 3, 2), dtype=np.float64)
+    angle = np.arctan2(corners[..., 1], corners[..., 0]) / (2.0 * np.pi) % 1.0
+    # シーム(theta=0/2pi)を跨ぐ面は、小さい側に 1 周ぶん足して u を単調にする。
+    # 側面の 1 三角形が張る角度は 1/32 周なので、0.5 周のギャップはシームでしか
+    # 生じない。結果として展開角の正規化値は [0, 1] に収まる。
+    seam_shift = np.where(angle < angle.max(axis=1, keepdims=True) - 0.5, 1.0, 0.0)
+    # 各領域とも [0,1]^2 の正規化座標を作ってから `_place_in_patch` で外枠へ写す。
+    side_s = (angle + seam_shift)[is_side]
+    side_t = 0.5 - corners[is_side][..., 2] / height  # z=+1 -> 0(上端)/ z=-1 -> 1
+    uv[is_side, :, 0], uv[is_side, :, 1] = _place_in_patch(
+        side_s, side_t, _CYLINDER_UV_RECTS["side"]
+    )
+    # 半径 0.5 の円盤 → [0,1]^2 の正規化座標(中心が 0.5, 0.5)。
+    uv[is_top, :, 0], uv[is_top, :, 1] = _place_in_patch(
+        corners[is_top][..., 0] + 0.5,
+        corners[is_top][..., 1] + 0.5,
+        _CYLINDER_UV_RECTS["top"],
+    )
+    uv[is_bottom, :, 0], uv[is_bottom, :, 1] = _place_in_patch(
+        0.5 - corners[is_bottom][..., 0],
+        corners[is_bottom][..., 1] + 0.5,
+        _CYLINDER_UV_RECTS["bottom"],
+    )
+
+    return (
+        corners.reshape(-1, 3),
+        np.arange(len(base_faces) * 3, dtype=np.int64).reshape(-1, 3),
+        uv.reshape(-1, 2).astype(np.float32),
+    )
+
+
+@pytest.fixture
+def capped_cylinder_mesh() -> MeshData:
+    """両端に平らなキャップを持つ円筒(128 面 / 位置weld 後 66 頂点)。
+
+    側面 64 面・+Z キャップ 32 面・-Z キャップ 32 面。側面とキャップの二面角は
+    90 度なので、`angle_deg=60` では 3 部位に割れることが期待値
+    (計画v4 §5 Step 2-2)。
+    """
+    vertices, faces, uv = _build_capped_cylinder_geometry()
+    return MeshData(
+        vertices=vertices,
+        faces=faces,
+        uv=uv,
+        maps={},
+        source_vertex=np.arange(len(vertices), dtype=np.int64),
+    )
+
+
+@pytest.fixture
+def nonmanifold_mesh() -> MeshData:
+    """1 本の辺を **3 面** が共有する非多様体メッシュ(負の対照)。
+
+    辺 (v0, v1) を面 0/1/2 が共有する。面 0 と面 1 は同一平面・同一法線なので、
+    もし隣接と見なされれば `angle_deg=180` では必ず結合する — 「非多様体辺は
+    必ずカット」という規約が効いていなければ落ちるテストになる。他の辺はどれも
+    1 面しか持たないので、隣接は 1 組も生じないのが期待値。
+    """
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],  # 0: 共有辺の端点
+            [1.0, 0.0, 0.0],  # 1: 共有辺の端点
+            [0.0, 1.0, 0.0],  # 2: 面 0 の第 3 頂点(z=0 平面)
+            [0.0, -1.0, 0.0],  # 3: 面 1 の第 3 頂点(z=0 平面・面 0 と同一法線)
+            [0.0, 0.0, 1.0],  # 4: 面 2 の第 3 頂点(z=0 平面から立ち上がる)
+        ],
+        dtype=np.float64,
+    )
+    faces = np.array([[0, 1, 2], [1, 0, 3], [0, 1, 4]], dtype=np.int64)
+    return MeshData(
+        vertices=vertices,
+        faces=faces,
+        source_vertex=np.arange(len(vertices), dtype=np.int64),
+    )
+
+
+@pytest.fixture
+def zero_area_mesh() -> MeshData:
+    """零面積(3 点が共線)の面を 1 枚含むメッシュ(負の対照)。
+
+    面 0 (v0,v1,v2) と面 1 (v0,v2,v3) は z=0 平面の正方形を 2 分割したもので、
+    辺 (v0,v2) を共有し二面角 0 度。面 2 (v0,v1,v4) は v0/v1/v4 が x 軸上で共線
+    なので零面積で、辺 (v0,v1) を面 0 と共有する(= 多様体隣接としては成立する)。
+    零面積面のカット規約が無いと法線 0 ベクトルの内積 0 が 90 度と解釈され、
+    `angle_deg=180` では面 2 まで結合してしまう — それを弾くための対照。
+    """
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],  # 0
+            [1.0, 0.0, 0.0],  # 1
+            [1.0, 1.0, 0.0],  # 2
+            [0.0, 1.0, 0.0],  # 3
+            [2.0, 0.0, 0.0],  # 4: v0, v1 と共線
+        ],
+        dtype=np.float64,
+    )
+    faces = np.array([[0, 1, 2], [0, 2, 3], [0, 1, 4]], dtype=np.int64)
+    return MeshData(
+        vertices=vertices,
+        faces=faces,
+        source_vertex=np.arange(len(vertices), dtype=np.int64),
+    )

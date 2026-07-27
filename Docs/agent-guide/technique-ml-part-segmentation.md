@@ -125,7 +125,16 @@
 |---|---|
 | **moderngl ヘッドレス描画** | **成功**。`create_context(standalone=True)` がウィンドウ無しで通り、`GL_VERSION = 3.3.0 NVIDIA 591.86` / `GL_RENDERER = NVIDIA GeForce RTX 4080/PCIe/SSE2`。64x64 のオフスクリーン描画でピクセル値も期待どおり(0.2/0.4/0.6 → 51/102/153)。**Windows 配布性の柱が実証された** |
 | moderngl 配布 | MIT・win_amd64 wheel が cp38〜cp313 で提供【実測 PyPI】 |
-| sam2 配布 | PyPI に `sam2 1.1.0`・Apache 2.0。ただし **sdist のみ(wheel 無し)**【実測 PyPI】— ビルド要否は隔離環境で検証中 |
+| sam2 配布 | PyPI に `sam2 1.1.0`・Apache 2.0。**sdist のみ(wheel 無し)だがコンパイラ不要でビルド通過**【実測】 |
+| **sam2 導入(隔離venv・Python 3.12)** | **成功**。`uv pip install torch torchvision --index-url .../cu124` → `uv pip install sam2` の**2コマンドのみ**。torch 2.6.0+cu124 / `cuda avail=True` / RTX 4080 / **sm_89** 認識 |
+| **重みの取得** | `SAM2ImagePredictor.from_pretrained('facebook/sam2-hiera-tiny')` が **HF から認証不要でDL+ロード、14.8秒**【実測】 |
+| **推論の正しさ** | 256x256 の合成画像(中央 128² の矩形)に点プロンプト → **best mask のピクセル数 16384 = 128² と厳密一致**。**0.38秒/画像**(GPU)【実測】 |
+| **自動マスク生成** | `SAM2AutomaticMaskGenerator` 利用可。`points_per_side=16` で **1.09秒**、90²=8100 の矩形3つを **8100/8100/8099** で検出【実測】。粒度制御パラメータ: points_per_side / pred_iou_thresh / stability_score_thresh / box_nms_thresh / crop_n_layers / min_mask_region_area |
+| 処理時間の見込み | 0.38秒/画像 × 16視点 ≒ **6秒/メッシュ**。SAMPart3D の **6分/メッシュ** と桁違い |
+
+**結論(実測ベース)**: SAM2 経路は **Windows でコンパイラ不要・wheel 中心・認証不要**で成立する。
+工学的リスクはほぼ解消。**残る唯一の未検証は「実際のAI生成キャラクターで意味のある部位に
+分かれるか」**(検証用メッシュ待ち)。
 - **再評価トリガー**:
   - AI生成メッシュでの SAM2 経路の品質実測が出たとき(最優先)
   - SAMPart3D が面ラベル出力の公式経路を提供 or Windows 対応を表明したとき(issue #26/#33 の動向)

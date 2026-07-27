@@ -132,9 +132,35 @@
 | **自動マスク生成** | `SAM2AutomaticMaskGenerator` 利用可。`points_per_side=16` で **1.09秒**、90²=8100 の矩形3つを **8100/8100/8099** で検出【実測】。粒度制御パラメータ: points_per_side / pred_iou_thresh / stability_score_thresh / box_nms_thresh / crop_n_layers / min_mask_region_area |
 | 処理時間の見込み | 0.38秒/画像 × 16視点 ≒ **6秒/メッシュ**。SAMPart3D の **6分/メッシュ** と桁違い |
 
-**結論(実測ベース)**: SAM2 経路は **Windows でコンパイラ不要・wheel 中心・認証不要**で成立する。
-工学的リスクはほぼ解消。**残る唯一の未検証は「実際のAI生成キャラクターで意味のある部位に
-分かれるか」**(検証用メッシュ待ち)。
+### torch の Windows 配布事情【実測 2026-07-27】— 重要な留保
+
+**素の PyPI から入る Windows 版 torch は CPU 専用**。実測:
+
+```
+uv pip install torch          # index-url 指定なし
+version = 2.13.0+cpu
+cuda available = False
+compiled with CUDA = None
+```
+
+裏付け(PyPI メタデータ実測): torch の CUDA 依存はすべて `platform_system == "Linux"` で
+ゲートされており(`cuda-toolkit==13.0.3; platform_system == "Linux"`、`nvidia-cudnn-cu13`、
+`nvidia-nccl-cu13` 等)、**Windows 向けの CUDA 依存は1件も無い**。wheel サイズも
+win_amd64 が 116MB に対し manylinux_x86_64 は 502MB。
+
+**帰結**: `pip install atlasmith[ml]` を Windows で実行すると **CPU 版 torch が入る**。
+SAM2 の自動マスク生成は1画像あたり多数のプロンプトを走らせるため、CPU では実用にならない。
+**Windows ユーザーには `--index-url https://download.pytorch.org/whl/cuXXX` の明示が必要**。
+
+**この留保は SAM2 採用の判断を覆さない**: SAMPart3D が要求したのは CUDA Toolkit の新規導入+
+MSVC+ソースビルド4件だったのに対し、こちらは **index を1つ指定するだけ**。桁が違う。
+ただし README/インストール手順にこの1ステップを明記することが**必須**(黙っていると
+「入ったのに遅い」という最悪の体験になる)。対処方針(README 明記 / `[tool.uv.sources]` /
+実行時の CPU 検出警告)は計画 v3 の承認事項として裁定する。
+
+**結論(実測ベース)**: SAM2 経路は **Windows でコンパイラ不要・wheel 中心・認証不要**で成立する
+(torch の index 指定という1ステップの留保付き)。工学的リスクはほぼ解消。
+**残る唯一の未検証は「実際のAI生成キャラクターで意味のある部位に分かれるか」**(検証用メッシュ待ち)。
 - **再評価トリガー**:
   - AI生成メッシュでの SAM2 経路の品質実測が出たとき(最優先)
   - SAMPart3D が面ラベル出力の公式経路を提供 or Windows 対応を表明したとき(issue #26/#33 の動向)

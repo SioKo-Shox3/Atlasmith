@@ -1,7 +1,7 @@
 # 技術選定記録: ML部位分割バックエンド(①部位分割)
 
-日付: 2026-07-26(調査)/ 2026-07-27(決定) ／ 状態: **決定済み** ／
-決定者: ユーザー承認「**調査結果見て判断します。SAM2 自前実装に移行しましょう**」(2026-07-27)
+日付: 2026-07-26(調査)/ 2026-07-27(バックエンド決定・Phase 2実装再開承認) ／ 状態: **決定済み・Phase 2実装再開承認済み** ／
+決定者: ユーザー承認「**調査結果見て判断します。SAM2 自前実装に移行しましょう**」(2026-07-27)。Phase 2実装再開の承認事項 A/A2/C'/E/F/G/H は 2026-07-27 付ユーザー裁定(本ファイル末尾「ユーザー裁定(2026-07-27)」節を参照)。
 
 ## 課題定義
 
@@ -166,3 +166,67 @@ MSVC+ソースビルド4件だったのに対し、こちらは **index を1つ�
   - SAMPart3D が面ラベル出力の公式経路を提供 or Windows 対応を表明したとき(issue #26/#33 の動向)
   - Apache-2.0 互換で**一回推論**の mesh part segmentation モデルが登場したとき
   - Objaverse 学習重みのライセンス継承について法的整理が進んだとき(現在は業界共通の未確定論点)
+
+### 直接依存のライセンス一次資料確認【実測 2026-07-27、オーケストレーター実行】
+
+Step 2-0(計画v4)の一次資料確認。PyPI JSON API と GitHub raw から取得(本セッションのオーケストレーターが
+実行。本セッションの実装担当は再測していない)。
+
+| パッケージ | 取得元 | 結果 |
+|---|---|---|
+| torch | PyPI JSON API | version=2.13.0 / `license=''` / `license_expression='Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND MIT'`(**複合ライセンス**) |
+| sam2 | PyPI JSON API | version=1.1.0 / `license='Apache 2.0'` |
+| moderngl | PyPI JSON API | version=5.12.0 / `license='MIT'`。classifiers に `License :: OSI Approved :: MIT License` |
+
+torch の LICENSE 全文(`https://raw.githubusercontent.com/pytorch/pytorch/v2.9.0/LICENSE`、全85行)を実取得。
+冒頭 `From PyTorch:` / `Copyright (c) 2016- Facebook, Inc (Adam Paszke)` …、本文に
+`Redistribution and use in source and binary forms, with or without` を含む **BSD 系文言**。
+`GPL` の文字列ヒットは **0 件**。
+
+**判定**: 直接依存3件とも Apache-2.0 互換・copyleft ゼロ。
+
+**計画v4 §3 の訂正事項**: `Docs/plans/2026-07-27-phase2-plan-v4.md:585` は「torch = BSD-3-Clause」と
+単独表記しているが、PyPI の `license_expression` は上記の**複合**(BSD-3-Clause ベース + 同梱コンポーネント
+が Apache-2.0 / Apache-2.0 WITH LLVM-exception / BSD-2-Clause / BSL-1.0 / MIT の AND)。実体としてはいずれも
+permissive で copyleft を含まないため絶対規則3には抵触しないが、**単独表記は不正確であり複合表記へ訂正する**
+(この訂正は `Docs/plans/2026-07-27-phase2-plan-v4.md` §0-B に反映済み)。
+
+**留保(等級を偽らない)**: 上記は**直接依存3件のみ**の確認であり、**推移的依存(`uv sync --extra ml` が引く
+hydra-core / iopath / omegaconf / sympy / networkx 等数十パッケージ、および Linux 側の `nvidia-*` / `triton`
+等)のライセンス検証は未実施**。この検証は計画v4 §0-A 条件8 により Step 2-1 の合否ゲート
+(`uv tree --universal` / `uv.lock` パース併用)に委ねられている。
+
+### ユーザー裁定(2026-07-27)— Phase 2 実装再開と ML 依存の承認
+
+計画v4(`Docs/plans/2026-07-27-phase2-plan-v4.md`)§4.4 の承認事項7件について、2026-07-27 にユーザー裁定を
+取得した。
+
+| 記号 | 内容 | 裁定 | 備考 |
+|---|---|---|---|
+| A | Phase 2 実装再開の承認 | **再開する** | Step 2-1.5(SAM2品質spike)は実AI生成メッシュ未受領のため待機。計画v4 §0-A 条件11 により Step 2-1/2-2/2-6 は spike に依存せず並行して進む |
+| A2 | optional `[ml]`(torch/sam2/moderngl)の追加 | **承認** | 推移的依存のライセンス検証を Step 2-1 の合否ゲート化。計画v4 §0-A 条件8 により Linux 側依存(`nvidia-*`/`triton` 等)も `uv tree --universal` / `uv.lock` パースで検査する |
+| C' | `segmentation.multiview` の公開シンボル5 + CLI フラグ3の追加 | **承認** | トップレベル re-export は `SegmentationBackend` / `DihedralSegmenter` のみ(v2裁定Cの範囲を超えない) |
+| E | 既定バックエンド | **`sam2`**(planner 推奨の `geometric` ではない) | 下記「E の帰結」参照 |
+| F | `SegmentationBackend` 契約から「決定的」を必須要件から外す | **承認** | — |
+| G | 重みの実行時DL許容+ライセンス注記の置き場所 | **承認(4箇所)** | `Docs/licenses/THIRD-PARTY-ML.md` / `NOTICE`(新設)/ README節 / 隔離モジュールdocstring |
+| H | torch の CUDA 版導入方式 | **(1)+(3) の併用** | README に `--index-url https://download.pytorch.org/whl/cu124` 手順を明記 + 実行時 CPU 検出警告。(2) `[tool.uv.sources]` は不採用 |
+
+B(既定 `granularity="part"`)/ D(アトラス寸法規約案(b))は計画v2で承認済みにつき再確認不要。
+
+**E は planner 推奨(`geometric`)と異なる裁定**である。ユーザーは配布性より品質を優先し `sam2` を選んだ。
+これに伴いオーケストレーターが提示した副作用2件を含め、以下3点の帰結が確定した:
+
+1. **CLI 既定 `--segmenter` = `sam2`。**
+2. **`[ml]` 未導入環境では、既定経由のときだけ `warnings.warn` して `geometric` へフォールバックする。**
+   `--segmenter sam2` を明示指定した場合は計画v4 §2.6 どおり厳格に `ImportError`(黙ってフォールバックしない
+   原則は明示指定経路で保たれる)。既定経由のフォールバックは警告を出すため「黙って」ではない。
+   **WHY**: `.github/workflows/ci.yml:21` は `uv sync --locked`(extras無し)。既定が `sam2` で厳格
+   `ImportError` だと CLI 既定パスを踏む既存 `tests/test_cli.py` の5件が CI で落ち、計画v4 §1「不変: CI は
+   GPU無しランナーでgreenを維持する」と §0-A条件3(既存CLIテスト5件が無変更でgreen)の両方に正面衝突する。
+3. **`rebake()` の API 既定は `segmentation=None` → `DihedralSegmenter()` のまま据え置き。**
+   **WHY**: `rebake` が既定でSAM2バックエンドを構築すると `rebake` が `segmentation.multiview` をimport
+   することになり、計画v4 §2.1の依存方向(`atlasmith(rebake) → segmentation`、numpyのみ)が壊れる。§4.1
+   の「`rebake` はsam2を知らない」を維持する。**したがってEはCLIレイヤの既定としてのみ実装される**。API
+   とCLIで既定が異なることを `rebake` のdocstringとREADMEに明記する(Step 2-7/2-8の作業項目)。
+
+詳細な裁定根拠と計画v4本文の書き換え箇所は `Docs/plans/2026-07-27-phase2-plan-v4.md` §0-B を参照。

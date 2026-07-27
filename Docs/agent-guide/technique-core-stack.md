@@ -35,7 +35,7 @@
 ## 決定記録
 - 採用: trimesh 4.12.2(MIT)+ numpy(BSD-3)+ xatlas 0.0.11(MIT)+ ruff(MIT)+ pytest(MIT)。理由: 全て Apache-2.0 互換で、Phase 0/1 の中核要件(glTF/OBJ I/O・UV アトラス生成・恒等転写検証)を直接満たすため。
 - 却下:
-  - libigl 2.6.2(MPL-2.0): 今回導入せず Phase 2 で再評価する。理由: wheel に copyleft サブモジュール(CGAL/tetgen 等)が含まれるか Phase 2 記録時に要確認であり、Phase 0/1 のスコープには過剰なため。
+  - libigl 2.6.2(MPL-2.0): 今回導入せず Phase 2 で再評価する。理由: wheel に copyleft サブモジュール(CGAL/tetgen 等)が含まれるか Phase 2 記録時に要確認であり、Phase 0/1 のスコープには過剰なため。**Phase 2 での Windows 導入実測【実測2026-07-14、`Docs/plans/2026-07-14-phase2-plan.md:50` の記録の引用】**: PyPI 2.6.2 に win wheel 無し、sdist は nanobind の CMake ビルドが失敗し、当 Windows 開発機では pip 導入不可。
   - PartField: 今回導入しない。理由: NVIDIA 独自ライセンスで Apache-2.0 非互換の可能性大であり、導入判断はユーザーがライセンス全文を確認してから行う必要があるため。将来的に optional 依存 `[ml]` としての設計余地のみ確保する。
   - 何もしない(自前実装): glTF パーサ・アトラスパッキングの再発明でスコープを大幅に超過するため不採用。
-- **再評価トリガー**: (1) xatlas バインディングのメンテナンスが停止した場合、(2) trimesh に破壊的変更が入り移行コストが問題になる場合、(3) Phase 2 でシーム生成モデル(SeamGPT 系等)の導入を検討する時点、(4) libigl の wheel 内 copyleft サブモジュール混入の有無が確認できた時点(Phase 2 再評価の前提条件)。
+- **再評価トリガー**: (1) xatlas バインディングのメンテナンスが停止した場合、(2) trimesh に破壊的変更が入り移行コストが問題になる場合、(3) Phase 2 でシーム生成モデル(SeamGPT 系等)の導入を検討する時点、(4) libigl の wheel 内 copyleft サブモジュール混入の有無が確認できた時点(Phase 2 再評価の前提条件)。**(4)の判断結果(2026-07-27、計画v4 Step 2-0)**: Windows でのpip導入不可が実測(引用)で再確認されたため、**libigl は Phase 3 以降へ延期**する。SLIM/ARAP による歪み最小化展開は Phase 2 のスコープ外(計画v4 §1「Phase 3以降へ延期するもの」— `Docs/plans/2026-07-27-phase2-plan-v4.md:246`)。

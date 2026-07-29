@@ -694,3 +694,101 @@ def zero_area_mesh() -> MeshData:
         faces=faces,
         source_vertex=np.arange(len(vertices), dtype=np.int64),
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Step 2-1: `gl` / `ml` マーカーの能力検出 skip(計画v4 §2.7)
+#
+# 既存の fixture / ヘルパ / 定数は 1 行も変更していない(以下はすべて追加)。
+#
+# WHY 「import 可能性」ではなく能力検出か: extras を入れた CI ランナーでは moderngl が
+# import **できてしまう**が GL コンテキストは無い。`pytest.importorskip("moderngl")` は
+# この状況を skip にできず、テストは `create_context` で fail する。torch も同様に、
+# import できても CUDA GPU が見えなければ ML ゲートは意味を成さない。よって
+# 「実際に作れるか / 実際に CUDA が見えるか」を試して判定する。
+#
+# WHY 検出を遅延させるか: 検出は moderngl / torch / sam2 を **実際に import する**ので、
+# 呼んだ時点でセッションの `sys.modules` にそれらが常駐する。該当マーカーの item が
+# 1 つも収集されていなければ 1 度も import しない(`-m "not gl and not ml"` = CI 相当の
+# 実行では走らない)。**この副作用があるため import 隔離ゲート
+# (`tests/test_import_isolation.py`)は同一プロセスではなく subprocess で検査する**
+# — 計画 §0-A 条件1。
+# ---------------------------------------------------------------------------
+
+# 能力検出の対象マーカー。`pyproject.toml` の `markers` と同期させること
+# (`--strict-markers` 下では未登録マーカーは collection エラーになる)。
+_CAPABILITY_MARKERS = ("gl", "ml")
+
+
+def _gl_available() -> bool:
+    """standalone な OpenGL コンテキストを実際に生成できるかを試す。
+
+    成功したら即 `release()` して True を返す。moderngl 未導入・ドライバ不在・
+    EGL/GLX の初期化失敗などはすべて False。例外型はプラットフォームとドライバで
+    多様(`ImportError` / `moderngl.Error` / `OSError` 等)なので `Exception` で受ける。
+    """
+    try:
+        import moderngl
+
+        ctx = moderngl.create_context(standalone=True)
+    except Exception:
+        return False
+    try:
+        ctx.release()
+    except Exception:
+        # 解放に失敗しても「コンテキストを作れた」という判定自体は変えない。
+        pass
+    return True
+
+
+def _ml_available() -> bool:
+    """torch と sam2 が import でき、かつ CUDA GPU が見えるかを判定する。
+
+    CPU 版 torch(Windows の既定 wheel)では `torch.cuda.is_available()` が False に
+    なるため、ML ゲートは skip される — これは想定内(計画v4 §3)。
+    """
+    try:
+        import sam2  # noqa: F401
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+_CAPABILITY_DETECTORS: dict[str, Callable[[], bool]] = {
+    "gl": _gl_available,
+    "ml": _ml_available,
+}
+
+_CAPABILITY_SKIP_REASONS = {
+    "gl": (
+        "no usable OpenGL context: moderngl.create_context(standalone=True) failed "
+        "(needs `uv sync --extra ml` and a machine with a working GPU/GL driver)"
+    ),
+    "ml": (
+        "torch/sam2 not importable or no CUDA GPU visible "
+        "(needs `uv sync --extra ml` plus a CUDA build of torch)"
+    ),
+}
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """`gl` / `ml` マーカー付きの item を、能力が無い環境では skip に落とす。
+
+    検出は **該当マーカーの item が実際に収集されているときだけ**、マーカーごとに
+    高々 1 回だけ走る(結果は `detected` にキャッシュ)。
+    """
+    detected: dict[str, bool] = {}
+    for item in items:
+        for marker_name in _CAPABILITY_MARKERS:
+            if item.get_closest_marker(marker_name) is None:
+                continue
+            if marker_name not in detected:
+                detected[marker_name] = _CAPABILITY_DETECTORS[marker_name]()
+            if not detected[marker_name]:
+                item.add_marker(
+                    pytest.mark.skip(reason=_CAPABILITY_SKIP_REASONS[marker_name])
+                )
+                # gl/ml 両方が付いた item でも skip マーカーは 1 個で足りる。
+                break

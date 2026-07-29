@@ -11,6 +11,19 @@ dependencies = [
     "xatlas>=0.0.11",
 ]
 
+# ML 部位分割(Phase 2)専用の optional 依存。必須依存は上の `dependencies` のまま
+# 変更しない — `[ml]` 未導入でも全ての決定的経路(CI 含む)が動く前提を守る。
+# torch の CUDA 版は PyPI の既定 wheel では入らない(Windows は CPU 専用)。`uv sync --extra ml`
+# の後に `--index-url https://download.pytorch.org/whl/cu126` で torch/torchvision を差し替える。
+# `--no-deps` 必須 — 付けないと numpy/pillow 等が PyTorch index 側の旧版へ巻き戻る。
+# 手順全文と cu124 が使えない理由は `Docs/licenses/THIRD-PARTY-ML.md` §6。
+[project.optional-dependencies]
+ml = [
+    "torch>=2.5.1",
+    "sam2>=1.1.0,<2",
+    "moderngl>=5.10",
+]
+
 [project.scripts]
 atlasmith = "atlasmith.cli:main"
 
@@ -35,3 +48,18 @@ select = ["E", "F", "I"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `--strict-markers`: マーカーのタイポを collection エラーにする。無言で通ると
+# 「ml が非 skip で green だった」という証拠自体が無意味になるため(計画v4 §2.7)。
+addopts = "--strict-markers"
+# `gl` / `ml` の skip 判定は「import 可能性」ではなく能力検出(tests/conftest.py の
+# `pytest_collection_modifyitems`)で行う。CI は `-m "not ml and not gl"` で除外する。
+# `slow`: **登録する**方を選んだ(計画 §0-A 条件2 の二択)。Step 2-5 ゲート10 が
+# 既定パラメータ実行に `@pytest.mark.slow` の併記を認めており、`--strict-markers` の
+# 下では未登録マーカーが collection エラーで即死するため、使う側のステップが
+# `pyproject.toml`(そのステップの許可パス外)を触らずに済むよう先に登録しておく。
+# 現時点で `slow` を使うテストは無く、除外もしない(付いていても実行される)。
+markers = [
+    "gl: requires a working OpenGL context",
+    "ml: requires torch/sam2 and a CUDA GPU",
+    "slow: takes a long time (e.g. default-parameter ML runs); not excluded anywhere yet",
+]

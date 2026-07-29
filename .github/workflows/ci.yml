@@ -22,4 +22,8 @@ jobs:
       - run: uv run python -c "import sys; print(sys.version)"
       - run: uv run ruff format --check .
       - run: uv run ruff check .
-      - run: uv run pytest
+      # WHY マーカー除外: 上の `uv sync --locked` は extras 無し(= torch/sam2/moderngl
+      # は入らない)で走り、GitHub Actions ランナーは CUDA GPU も GL コンテキストも
+      # 持たない。`gl`/`ml` のテストは能力検出で skip されるが、除外を明示して
+      # 「CI で何を検証していないか」をワークフロー側にも残す(計画v4 §2.7)。
+      - run: uv run pytest -m "not ml and not gl"

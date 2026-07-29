@@ -22,6 +22,18 @@ ml = [
     "torch>=2.5.1",
     "sam2>=1.1.0,<2",
     "moderngl>=5.10",
+    # WHY: sam2 の `build_sam2_hf`(HuggingFace から重みを取得する**唯一の**経路)は
+    # `from huggingface_hub import hf_hub_download` を実行するが、sam2 1.1.0 自身は
+    # huggingface_hub を依存宣言していない。宣言を欠くと重み取得が
+    # `ModuleNotFoundError: No module named 'huggingface_hub'` で失敗し、SAM2 バックエンドが
+    # 原理的に動かない(Step 2-1.5 spike の初回実行が実際にこれで落ちた。
+    # 実測 2026-07-29 / 経緯は `Docs/licenses/THIRD-PARTY-ML.md` §9)。sam2 側の欠落を
+    # Atlasmith が肩代わりして宣言する。
+    # 下限 `>=1.25.1`: spike で重み取得が成功した**実測版**に合わせた。より古い版が動かない
+    # という意味ではない(未測定 — 動作を確認できているのが 1.25.1 だけ、という記録)。
+    # 上限 `<2`: 上の `sam2` と同じ理由。第三者パッケージが暗黙に使う import であり、
+    # major 更新で API が消えると重み取得だけが壊れる。互換性は実測してから広げる。
+    "huggingface_hub>=1.25.1,<2",
 ]
 
 [project.scripts]

@@ -254,3 +254,93 @@ PyTorch の index は PyPI のミラーも兼ねているため、`--no-deps` �
   重み・学習データ・再配布の有無の記載は Step 2-8 の清書で行う。
 - **本検査は当開発機で解決された `uv.lock` の内容に対するもの。** 利用者の環境で
   異なるバージョンが解決された場合の結果は保証しない。
+
+---
+
+## 9. Step 2-1 の追補 — `huggingface_hub` の追加(2026-07-29)
+
+### 9.1 経緯 — なぜ後から足されたのか
+
+**Step 2-1 の初版(§1〜§8)では `huggingface_hub` が `[ml]` extras から欠落していた。**
+発覚したのは Step 2-1.5(SAM2 spike)の**初回実行が失敗した**ときである
+【実測 2026-07-29、オーケストレーター実行】:
+
+```
+File "...\.venv\Lib\site-packages\sam2\build_sam.py", line 145, in _hf_download
+    from huggingface_hub import hf_hub_download
+ModuleNotFoundError: No module named 'huggingface_hub'
+```
+
+`sam2` の `build_sam2_hf`(HuggingFace から重みを取得する**唯一の**経路)は `huggingface_hub` を
+import するが、**sam2 パッケージ自身はそれを依存宣言していない**。したがって計画v4 §3 の
+`[ml] = torch / sam2 / moderngl` のままでは**重みを取得できず、SAM2 バックエンドが原理的に動かない**。
+
+**なぜ Step 2-1 の時点で見えなかったか**: 先行する導入実測
+(`Docs/agent-guide/technique-ml-part-segmentation.md:130`「HF から認証不要で DL+ロード、14.8秒」)は
+**隔離 venv** で取得したものであり、その venv には何らかの経路で `huggingface_hub` が入っていた。
+**欠落は「動いた」という実測の陰に隠れていた**(依存宣言の検証にはならない実測だった)。
+
+**対処**: `pyproject.toml` の `[project.optional-dependencies].ml` に
+`huggingface_hub>=1.25.1,<2` を追加した。下限・上限それぞれの理由は同ファイルのコメントに記載。
+
+### 9.2 追加で入る9パッケージのライセンス
+
+【実測 2026-07-29、オーケストレーター実行】`uv pip install huggingface_hub` の dry-run 結果。
+**既存パッケージのダウングレードは発生しない**(9件の純増)。
+
+| パッケージ | ライセンス |
+|---|---|
+| `huggingface-hub` 1.25.1 | Apache-2.0 |
+| `hf-xet` | Apache-2.0 |
+| `anyio` | MIT |
+| `h11` | MIT |
+| `click` | BSD-3-Clause |
+| `httpcore` | BSD-3-Clause |
+| `httpx` | BSD-3-Clause |
+| `idna` | BSD-3-Clause |
+| `certifi` | **MPL-2.0** |
+
+§2 と同じ正規表現による検出は **0件**:
+
+```
+\b(A?GPL|LGPL|GPLv|GNU General Public|GNU Lesser|NonCommercial|non-commercial|CC BY-NC|Proprietary)\b
+```
+
+> 本節の数値・ライセンス欄はオーケストレーターの実測の転記である。**本節の執筆担当(implementer)は
+> `uv` を一切実行していない**(現行 `.venv` の CUDA 版 torch を巻き戻さないため意図的に回避した)。
+
+### 9.3 `certifi` の MPL-2.0 — 事実と評価を分けて書く
+
+**事実**【実測 2026-07-29、オーケストレーター実行】: `certifi` のライセンスは
+**MPL-2.0(Mozilla Public License 2.0)**であり、**本追加分9件の中で最も強い copyleft** である。
+残る8件は Apache-2.0 / MIT / BSD-3-Clause(いずれも非 copyleft)。
+
+**事実(本リポジトリの構成)**: Atlasmith は `certifi` を**改変しない**し、**同梱・再配布もしない**
+(`pip install atlasmith[ml]` / `uv sync --extra ml` の際にパッケージマネージャが PyPI から利用者環境へ
+直接取得する — §4.2 の根拠3と同じ構造)。
+
+**評価【推測】**(= 確認していない。根拠のある推定であって実測ではない): MPL-2.0 の copyleft は
+**ファイル単位の弱い copyleft** であり、MPL 対象ファイルを**改変した場合にそのファイルを MPL で
+提供する義務**が生じるだけで、同じプログラムに組み合わせた他ファイル(Atlasmith 自身の Apache-2.0
+コード)へライセンスが伝播しない、という理解に立つ。上の2つの事実(改変しない・再配布しない)と
+併せて、**Apache-2.0 の Atlasmith と両立すると判断する**。
+
+**留保(この判断の限界を隠さない)**:
+
+- **MPL-2.0 の全文は本作業では取得していない。** §1 の torch LICENSE のような一次資料の実取得を
+  行っておらず、上記のライセンス機構の理解は【推測】等級のままである。**法的助言ではない。**
+- MPL-2.0 は GPL / AGPL / LGPL ではないため、**Step 2-1 の停止条件(GPL 系を1件でも検出したら即停止)
+  には該当しない**(§9.2 の正規表現でも 0件)。「copyleft がゼロになった」のではなく、
+  **「禁止されている系統の copyleft は無い」**が正確な表現である。
+- **配布形態が変わった場合(Atlasmith が依存を同梱・再配布する形になった場合)は、上の事実2が崩れる。**
+  §7 のトリガー5 と同じく、そのときは判断そのものを再確認すること。
+
+### 9.4 §2 / §3 の集計は本追加より前のもの(再検証が必要)
+
+- §2 の「total distributions = 34」・§3 の「uv.lock total = 53 / Linux 専用 19」は、いずれも
+  **`huggingface_hub` 追加前**の集計である。本節の9件はそこに含まれていない。
+- 本追加は §7 の**トリガー3(新しい optional 依存を追加するとき)そのもの**に該当する。
+  `uv.lock` の再解決はオーケストレーターが行う予定であり、**再解決後に §2 / §3 を
+  `uv.lock` 全体(Linux 側を含む)に対して再実行して更新すること**(§3.1 の構造的注意)。
+- 本節の9件は **Windows での dry-run で観測された追加分**である。**Linux 側でさらに追加される
+  パッケージがあるかは未確認**(環境マーカー付き依存は当機の dry-run には現れない)。

@@ -792,3 +792,166 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 )
                 # gl/ml 両方が付いた item でも skip マーカーは 1 個で足りる。
                 break
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Step 2-3: screen 空間 z バッファの独立オラクル(計画v4 §5 Step 2-3 / BL-3)
+#
+# 既存の fixture / ヘルパ / 定数は 1 行も変更していない(以下はすべて追加)。
+#
+# **WHY 既存 `_rasterize_coverage`(:289)を使わず新ヘルパを足すのか**: 既存実装の
+# 勝者決定は **深度ではなく最小 face_id**(`if cov[r, c]: continue`、:324)。UV 空間では
+# チャートが重ならないので Phase 1 ではそれで正しかったが、**screen 空間かつ背面
+# カリング無効** では表面と裏面がほぼ全画素で競合し、GL は手前の面を・既存実装は最小
+# index の面を選ぶ(cube を -X から見ると GL は面 2/3、既存実装は面 0/1)。したがって
+# 面ID主ゲートのオラクルには使えない。**既存ヘルパは改変せず、別物として追加する。**
+# ---------------------------------------------------------------------------
+
+# screen 空間の重心座標での内外判定の許容(独自選定)。既存 `_INSIDE_EPS`(=1e-7)とは
+# 別値 — 共有辺の 1 画素幅を両方の面で拾いすぎないよう小さくとる。
+_SCREEN_INSIDE_EPS = 1e-9
+# screen 空間の符号付き 2 倍面積がこれ未満の面は縮退として捨てる(独自選定)。
+_SCREEN_MIN_DOUBLE_AREA = 1e-12
+# 近傍シフトで画像外を埋める番兵。実在値(-1 = 背景、0.. = 面)と衝突しない。
+_NO_FACE_SENTINEL = -2
+
+
+def _project_to_ndc(vertices: np.ndarray, camera: object) -> np.ndarray:
+    """頂点 `(N, 3)` を `camera` の NDC `(N, 3) float64` へ写す(clip → `/w`)。
+
+    独立オラクル `_rasterize_screen_zbuffer` の入力を作るためのテスト側ヘルパ。
+    production の `Camera.mvp` を使うのは意図的 — オラクルが独立しているべきなのは
+    **ラスタライズの勝者決定**であって、「比較対象と同じカメラを見ている」ことは
+    比較の前提そのものだから。
+
+    Args:
+        vertices: 頂点 `(N, 3)`。
+        camera: `atlasmith.segmentation.multiview.Camera`(`mvp` を持つもの)。
+    """
+    verts = np.asarray(vertices, dtype=np.float64)
+    homogeneous = np.concatenate(
+        [verts, np.ones((verts.shape[0], 1), dtype=np.float64)], axis=1
+    )
+    clip = homogeneous @ camera.mvp.T  # type: ignore[attr-defined]
+    return clip[:, :3] / clip[:, 3:4]
+
+
+def _rasterize_screen_zbuffer(
+    verts_ndc: np.ndarray, faces: np.ndarray, size: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """screen 空間 z バッファの独立ラスタライザ(GL の面ID出力のオラクル)。
+
+    Args:
+        verts_ndc: NDC まで持っていった頂点 `(N, 3)`(clip → `/w`)。
+            **前提: 全頂点が視錐台内**(near クリッピングは扱わない —
+            `cameras.validate_frustum` が production 側で保証する)。
+        faces: 三角形 `(M, 3)`。
+        size: 正方形画像の一辺(画素)。レンダラの `image_size` と同じ。
+
+    Returns:
+        `(face_id (H, W) int64, ndc_z (H, W) float64)`。背景の `face_id` は -1 で、
+        そのとき `ndc_z` は `+inf`。**row 0 = 画面上端**(GL の読み戻しを行反転した
+        後の規約に合わせる)。
+
+    深度は **screen 空間で線形補間**する(GL の深度補間と同じ)。属性の遠近補正は
+    要らない — 比べるのは深度だけで、`ndc_z` は screen 空間で線形なので
+    **透視投影でも正しい**。同深度の tie は最小 face index が勝つ(GL の
+    `depth_func='<'` と面 index 順の描画に一致する)。
+    """
+    ndc = np.asarray(verts_ndc, dtype=np.float64)
+    face_array = np.asarray(faces, dtype=np.int64)
+    n = int(size)
+    face_id = np.full((n, n), -1, dtype=np.int64)
+    depth = np.full((n, n), np.inf, dtype=np.float64)
+    # 画素中心が (col + 0.5, row + 0.5) になる screen 座標。row は上端が 0 なので、
+    # y は NDC を反転して作る(GL の viewport は下端原点 / こちらは読み戻し後の規約)。
+    sx = (ndc[:, 0] + 1.0) * 0.5 * n
+    sy = (1.0 - ndc[:, 1]) * 0.5 * n
+    sz = ndc[:, 2]
+    for i, face in enumerate(face_array):
+        ia, ib, ic = int(face[0]), int(face[1]), int(face[2])
+        ax, ay = sx[ia], sy[ia]
+        bx, by = sx[ib], sy[ib]
+        cx, cy = sx[ic], sy[ic]
+        area2 = _double_area(ax, ay, bx, by, cx, cy)
+        if abs(area2) < _SCREEN_MIN_DOUBLE_AREA:
+            continue  # 縮退三角形は 1 画素も塗らない。
+        col_lo = max(0, int(np.floor(min(ax, bx, cx) - 0.5)))
+        col_hi = min(n - 1, int(np.ceil(max(ax, bx, cx) + 0.5)))
+        row_lo = max(0, int(np.floor(min(ay, by, cy) - 0.5)))
+        row_hi = min(n - 1, int(np.ceil(max(ay, by, cy) + 0.5)))
+        if col_lo > col_hi or row_lo > row_hi:
+            continue
+        cols = np.arange(col_lo, col_hi + 1, dtype=np.float64) + 0.5
+        rows = np.arange(row_lo, row_hi + 1, dtype=np.float64) + 0.5
+        px, py = np.meshgrid(cols, rows)
+        # 部分三角形の符号付き面積比 = 正規化重心座標(入力 corner 順のまま)。
+        w0 = _double_area(px, py, bx, by, cx, cy) / area2
+        w1 = _double_area(ax, ay, px, py, cx, cy) / area2
+        w2 = _double_area(ax, ay, bx, by, px, py) / area2
+        inside = (
+            (w0 >= -_SCREEN_INSIDE_EPS)
+            & (w1 >= -_SCREEN_INSIDE_EPS)
+            & (w2 >= -_SCREEN_INSIDE_EPS)
+        )
+        if not inside.any():
+            continue
+        z = w0 * sz[ia] + w1 * sz[ib] + w2 * sz[ic]
+        window = (slice(row_lo, row_hi + 1), slice(col_lo, col_hi + 1))
+        # 厳密な `<` なので、同深度なら先に走査した(= index の小さい)面が残る。
+        wins = inside & (z < depth[window])
+        depth[window] = np.where(wins, z, depth[window])
+        face_id[window] = np.where(wins, i, face_id[window])
+    return face_id, depth
+
+
+def _shift_face_id(arr: np.ndarray, dr: int, dc: int, fill: int) -> np.ndarray:
+    """`arr[r+dr, c+dc]` を (r, c) へ集める非循環シフト(整数配列版)。
+
+    既存の `_shift_bool`(:341)と同じシフト規約だが、あちらは名前も docstring も
+    bool 前提なので **改変せずに値版を足す**(既存ヘルパ不可侵の制約)。
+    """
+    out = np.full_like(arr, fill)
+    height, width = arr.shape[:2]
+    r_src0, r_src1 = max(0, dr), min(height, height + dr)
+    c_src0, c_src1 = max(0, dc), min(width, width + dc)
+    r_dst0, r_dst1 = max(0, -dr), min(height, height - dr)
+    c_dst0, c_dst1 = max(0, -dc), min(width, width - dc)
+    if r_src0 < r_src1 and c_src0 < c_src1:
+        out[r_dst0:r_dst1, c_dst0:c_dst1] = arr[r_src0:r_src1, c_src0:c_src1]
+    return out
+
+
+def _faceid_interior_mask(face_id: np.ndarray) -> np.ndarray:
+    """面ID画像の「内部画素」= 前景かつ **8 近傍すべてが同じ face_id** の画素。
+
+    画像境界の外は「別の面」扱いなので、外周 1 画素は必ず False になる。
+
+    **WHY bool 収縮(`_erode8`)ではないのか**(BL-3(b)): 被覆 bool を収縮しても
+    削れるのは **シルエット境界だけ** で、面と面の境界画素(前景どうしなので bool
+    では区別が付かない)が残る。そこは GL の fill rule とオラクルの内外判定が正当に
+    食い違いうる場所なので、厳密一致を課す領域から外さなければならない。
+    """
+    fid = np.asarray(face_id)
+    interior = fid >= 0
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            interior &= _shift_face_id(fid, dr, dc, _NO_FACE_SENTINEL) == fid
+    return interior
+
+
+@pytest.fixture
+def project_to_ndc() -> Callable[..., np.ndarray]:
+    return _project_to_ndc
+
+
+@pytest.fixture
+def rasterize_screen_zbuffer() -> Callable[..., tuple[np.ndarray, np.ndarray]]:
+    return _rasterize_screen_zbuffer
+
+
+@pytest.fixture
+def faceid_interior_mask() -> Callable[..., np.ndarray]:
+    return _faceid_interior_mask

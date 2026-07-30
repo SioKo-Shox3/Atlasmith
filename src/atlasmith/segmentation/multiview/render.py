@@ -51,15 +51,14 @@ LOG = logging.getLogger(__name__)
 
 __all__ = ["MIN_IMAGE_SIZE", "SHADING_MODES"]
 
-# `shading` の受理値(計画v4 §2.4.3)。値はシェーダの `u_shading` へ渡す整数で、
-# GLSL 側の分岐と 1 対 1 に対応する。
-_SHADING_TEXTURE = 0
-_SHADING_NORMAL = 1
-_SHADING_TEXTURE_NORMAL = 2
+# `shading` の受理値(計画v4 §2.4.3)。値はシェーダの `u_shading` へそのまま渡す
+# 整数で、下の `_FRAGMENT_SHADER` の分岐(`u_shading == 1` → 法線色 / `== 0` →
+# albedo / それ以外 → 半々のブレンド)と 1 対 1 に対応する。
+# **この数値は GLSL 側との取り決め**なので、片方だけ変えると色が静かに入れ替わる。
 SHADING_MODES: dict[str, int] = {
-    "texture": _SHADING_TEXTURE,
-    "normal": _SHADING_NORMAL,
-    "texture_normal": _SHADING_TEXTURE_NORMAL,
+    "texture": 0,
+    "normal": 1,
+    "texture_normal": 2,
 }
 
 # レンダ画像の最小辺。これ未満は「独立オラクルと比較する内部画素が存在しない」
@@ -229,7 +228,6 @@ class _ModernglRenderer:
         "_texture",
         "_vao",
         "_vbo",
-        "face_codes",
         "image_size",
         "shading",
     )
@@ -265,17 +263,23 @@ class _ModernglRenderer:
         Raises:
             ValueError: `image_size` が小さすぎる・`shading` が未知・面数が
                 24bit 上限超過・面が 0 枚・`face_codes` の shape/値域が不正なとき。
+
+        Warns:
+            UserWarning: メッシュが自身の寸法に比べて原点から極端に遠いとき
+                (頂点を f4 で GPU へ送るため座標精度が落ちる —
+                `_warn_if_far_from_origin`)。
         """
+        # bool は int の派生なので `isinstance(x, int)` を素通りする。`True` を 1 と
+        # して受け取るより「int ではない」と言った方が呼び出し側に原因が伝わる。
         if isinstance(image_size, bool) or not isinstance(
             image_size, (int, np.integer)
         ):
             raise ValueError(
                 f"image_size must be an int, got {type(image_size).__name__}"
             )
-        if int(image_size) < MIN_IMAGE_SIZE:
-            raise ValueError(
-                f"image_size must be >= {MIN_IMAGE_SIZE}, got {int(image_size)}"
-            )
+        size = int(image_size)
+        if size < MIN_IMAGE_SIZE:
+            raise ValueError(f"image_size must be >= {MIN_IMAGE_SIZE}, got {size}")
         if shading not in SHADING_MODES:
             raise ValueError(
                 f"unknown shading {shading!r}, expected one of {sorted(SHADING_MODES)}"
@@ -304,8 +308,7 @@ class _ModernglRenderer:
                 f"face_codes must have shape ({n_faces},), got {codes.shape}"
             )
 
-        self.image_size: int = int(image_size)
-        self.face_codes: np.ndarray = codes
+        self.image_size: int = size
 
         basecolor = mesh.maps.get("basecolor")
         self._has_texture = mesh.uv is not None and basecolor is not None
@@ -347,6 +350,10 @@ class _ModernglRenderer:
             RuntimeError: すでに入場中/退場済みのインスタンスを再入したとき、
                 GL コンテキストを作れないとき、MRT に必要な
                 `GL_MAX_COLOR_ATTACHMENTS >= 2` を満たさないとき。
+            ValueError: `image_size` がこのドライバの割り当て上限
+                (`GL_MAX_TEXTURE_SIZE` / `GL_MAX_RENDERBUFFER_SIZE`)を超えるとき
+                — 上限はコンテキストを作るまで分からないので `__init__` では
+                弾けない。
             ImportError: moderngl 未導入のとき。
         """
         if self._state is _RendererState.ACTIVE:
@@ -422,6 +429,9 @@ class _ModernglRenderer:
                 "its GL resources have been released"
             )
 
+        # moderngl に触れるのは関数内 import 経由だけ(隔離規約)。`TRIANGLES` と
+        # GL 状態設定に必要なので、ここでも取り直す — `sys.modules` の辞書引きなので
+        # 視点ごとに呼んでも描画コストに埋もれる。
         moderngl = _import_moderngl()
         self._apply_gl_state(moderngl)
         if self._texture is not None:
@@ -430,9 +440,15 @@ class _ModernglRenderer:
         mvp = np.ascontiguousarray(camera.mvp.T, dtype="f4")
         self._program["u_mvp"].write(mvp.tobytes())
         self._fbo.use()
+        # 背景は RGBA=(0,0,0,0)・depth=1.0 でクリアする。面IDは `e = face_code + 1`
+        # として送るので、RGB=0 は「どの面でもない」(`face_id = -1`)へデコードされ、
+        # alpha=0 が非被覆を意味する — **面コード 0 の面と背景が衝突しないのはこの
+        # +1 バイアスのおかげ**(`faceid` の 24bit 規約)。
         self._fbo.clear(0.0, 0.0, 0.0, 0.0, depth=1.0)
         self._vao.render(moderngl.TRIANGLES)
 
+        # アタッチメント 0/1 はフラグメントシェーダの `layout(location = 0) f_color`
+        # / `layout(location = 1) f_code` に対応する(MRT 1 パスの 2 出力)。
         color_buf = self._read_rgba(0)
         code_buf = self._read_rgba(1)
         face_id, coverage = decode_face_id(code_buf)
@@ -579,7 +595,7 @@ class _ModernglRenderer:
         **解放中の例外は握り潰さず記録して続行する**: `__exit__` が例外を投げると
         伝播中の元例外を覆い隠すし、1 個の解放失敗で残りを漏らすのはもっと悪い。
         """
-        ordered = (
+        release_order = (
             ("fbo", self._fbo),
             ("color_texture", self._color_texture),
             ("code_texture", self._code_texture),
@@ -590,7 +606,7 @@ class _ModernglRenderer:
             ("program", self._program),
             ("ctx", self._ctx),
         )
-        for name, obj in ordered:
+        for name, obj in release_order:
             if obj is None:
                 continue
             try:
@@ -633,6 +649,10 @@ def _build_vertex_buffer(
         uvs = np.asarray(uv, dtype=np.float32)[faces].reshape(-1, 2).astype("f4")
     codes = np.asarray(_build_code_attribute(face_codes), dtype="f4")
     if codes.shape != (n_corners, 3):
+        # production では常に成立する(`_build_code_attribute` は必ず `(3M, 3)`)。
+        # それでも検査するのは、**あの関数が `flat` ゲートの monkeypatch 注入点**
+        # だから: 差し替えが違う形を返したときに、`np.hstack` の分かりにくい
+        # 次元エラーではなく原因の分かる例外で止める。
         raise ValueError(
             f"face-id attribute must have shape {(n_corners, 3)}, got {codes.shape}"
         )

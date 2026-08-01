@@ -1,30 +1,73 @@
 """多視点(SAM2)部位分割バックエンドの公開境界と寿命契約。
 
-この時点(Step 2-3)で公開するのは**データ契約と Protocol だけ**:
-`Camera` / `RenderedView` / `MeshRenderer` / `MaskProposer`。融合(`fusion.py`)
-と SAM2 アダプタ(`sam2_masks.py`)、それらを束ねる `MultiViewSegmenter` は
-Step 2-4 / 2-5 で追加される。
+この時点(Step 2-4)で公開するのは**データ契約・Protocol・決定的バックエンド**:
+`Camera` / `RenderedView` / `MeshRenderer` / `MaskProposer` /
+`MultiViewSegmenter`。SAM2 アダプタ(`sam2_masks.py`)と、それを束ねる
+`make_sam2_segmenter()` は Step 2-5 で追加される。
 
-**`render` をここで import しない**(計画v4 §2.1 規約2)。`render.py` は
-moderngl を触る隔離モジュールで、module 直下 import があると
-`import atlasmith.segmentation.multiview` だけで GL 依存が `sys.modules` へ
-載ってしまう。それを機械的に守っているのが `tests/test_import_isolation.py`。
-レンダラが要る側(Step 2-4 の `MultiViewSegmenter` と GL テスト)は
+**`render` / `sam2_masks` をここで import しない**(計画v4 §2.1 規約2)。
+どちらも第三者 GL/ML ライブラリを触る隔離モジュールで、module 直下 import が
+あると `import atlasmith.segmentation.multiview` だけで重い依存が
+`sys.modules` へ載る道が開く。それを機械的に守っているのが
+`tests/test_import_isolation.py`。レンダラが要る側(Step 2-5 の
+`make_sam2_segmenter` と GL テスト)は
 `atlasmith.segmentation.multiview.render` を**関数内で**明示的に import する。
+**`fusion` は numpy のみなので module 直下で import してよい。**
 
-依存方向(計画v4 §2.1): このモジュールは numpy と `cameras` だけに依存する。
+依存方向(計画v4 §2.1): このモジュールは numpy と `cameras` / `faceid` /
+`fusion`(いずれも numpy のみ)だけに依存する。
 """
 
 from __future__ import annotations
 
+import logging
+import warnings
 from types import TracebackType
-from typing import NamedTuple, Protocol
+from typing import Callable, NamedTuple, Protocol
 
 import numpy as np
 
-from atlasmith.segmentation.multiview.cameras import Camera
+from atlasmith.segmentation.adjacency import validate_angle_deg
+from atlasmith.segmentation.multiview import fusion
+from atlasmith.segmentation.multiview.cameras import (
+    DEFAULT_N_VIEWS,
+    PROJECTIONS,
+    Camera,
+    build_cameras,
+)
+from atlasmith.segmentation.multiview.faceid import validate_face_count
+from atlasmith.types import MeshData
 
-__all__ = ["Camera", "MaskProposer", "MeshRenderer", "RenderedView"]
+__all__ = [
+    "DEFAULT_IMAGE_SIZE",
+    "DEFAULT_PROJECTION",
+    "DEFAULT_SHADING",
+    "Camera",
+    "MaskProposer",
+    "MeshRenderer",
+    "MultiViewSegmenter",
+    "RenderedView",
+]
+
+_LOGGER = logging.getLogger(__name__)
+
+# 既定の投影方式(2026-07-29 オーケストレーター裁定3)。**WHY perspective**:
+# Step 2-1.5 spike で実測した投影はこれだけで、正射影は未実測。実測していない
+# 方式を既定にしない。
+DEFAULT_PROJECTION = "perspective"
+# 既定のレンダ解像度と色付け(同裁定3)。**WHY texture_normal**: spike の実測で
+# assigned_ratio が 0.721 → 0.980、観測辺が 3,491 → 6,986 に倍増し、追加コストは
+# 実質ゼロだった(24.1s vs 25.1s は誤差)。計画v4 §2.4.3 の planner 推奨と一致する。
+#
+# **この 2 つが `MultiViewSegmenter.__init__` の引数ではない WHY**: レンダラは
+# `renderer_factory` として注入され(§0-A 条件9)、解像度と色付けは**その factory が
+# 閉じ込める**値である。segmenter 側に同名の引数を置くと、注入された factory が
+# 実際に使う値と食い違っても誰にも分からない「嘘の引数」になる。値の検証も
+# `_ModernglRenderer.__init__`(`MIN_IMAGE_SIZE` / `SHADING_MODES`)が唯一の
+# 番人であり、ここでは複製しない。Step 2-5 の `make_sam2_segmenter` がこの 2 定数を
+# 既定値として読み、factory へ焼き込む。
+DEFAULT_IMAGE_SIZE = 1024
+DEFAULT_SHADING = "texture_normal"
 
 
 class RenderedView(NamedTuple):
@@ -66,8 +109,8 @@ class MeshRenderer(Protocol):
     受け取る(§0-A 条件9)。renderer はメッシュに依存するので長寿命化せず、
     **`segment()` 呼び出しごとに `with` で生成・破棄する** —
     つまり注入された renderer の `__enter__` / `__exit__` を呼ぶのは
-    `segment()` であって、注入した側ではない。`MultiViewSegmenter` 自身は
-    Step 2-4 で追加する(この時点では存在しない)。
+    `segment()` であって、注入した側ではない(Step 2-4 で実装済み — 下の
+    `MultiViewSegmenter.segment`)。
     """
 
     def __enter__(self) -> MeshRenderer:
@@ -106,3 +149,296 @@ class MaskProposer(Protocol):
     def close(self) -> None:
         """保持しているリソースを解放する(冪等であること)。"""
         ...
+
+
+class MultiViewSegmenter:
+    """多視点マスク投票による部位分割バックエンド(計画v4 §2.4)。
+
+    `SegmentationBackend`(`atlasmith.segmentation`)の構造的契約を満たす。
+    パイプライン:
+
+    ```
+    mesh --cameras--> Camera[V]
+         --renderer_factory(mesh)--> RenderedView(face_id, color, coverage)
+         --proposer--> masks (K, H, W) bool          <-- ここだけ非決定的
+         --fusion 段階A--> view_segment (V, M) int32
+         --fusion 段階B〜E--> labels (M,) int64
+    ```
+
+    **決定性**: マスク提案が同一なら**ビット決定的**(カメラ配置・面IDデコード・
+    2パス融合はすべて RNG 不使用)。SAM2 込みでは「安定」であって「決定的」では
+    ない — だから `MaskProposer` を Protocol で切り離してある(§2.2 の裁定 F)。
+
+    **所有権/寿命(§2.1)**:
+
+      - **`proposer` を所有する。** `close()` / `__exit__` が `proposer.close()`
+        を呼ぶ。重み数百 MB を持ちうるので、使い終わったら閉じること。
+      - **`renderer` は所有しない。** `renderer_factory(mesh)` で
+        `segment()` 呼び出しごとに生成し、`with` で囲んで破棄する。レンダラは
+        メッシュに束縛される(頂点バッファも面IDも mesh 依存)ので長寿命化できない。
+        **`__enter__` / `__exit__` を呼ぶのは `segment()`** であって、
+        factory を渡した側ではない(§0-A 条件9)。
+
+    **未 `__enter__` でも `segment()` を許す(§0-A 条件10・2026-07-29 裁定2)**:
+
+        segmenter = MultiViewSegmenter(proposer, factory)
+        labels = segmenter.segment(mesh)   # OK。`with` は必須ではない
+
+    これは `MeshRenderer` の契約(未入場の `render_view` は `RuntimeError`)と
+    **意図的に非対称**である。理由が違う:
+
+      - レンダラは `__enter__` で初めて GL リソースを作るので、未入場では
+        **物理的に動けない**。
+      - segmenter は `__init__` で受け取った proposer だけで**動ける**。
+        `__enter__` は「proposer を閉じる責任を引き受ける」という宣言であって、
+        使用開始の前提ではない。
+      - 決め手は API 契約: 計画v4 §2.1 は「**`rebake` は注入された backend を
+        閉じない**」と定めているので、`rebake(segmentation=make_sam2_segmenter())`
+        を `with` 無しで呼ぶ経路が**現実に踏まれる**。ここを `RuntimeError` に
+        すると、その公開 API が壊れる。
+
+    **ただし `__exit__` / `close()` 後の `segment()` は `RuntimeError`** —
+    proposer が閉じられており、黙って壊れた結果を返すよりは落ちるべきだから。
+
+    **スレッド**: シングルスレッド前提(`architecture.md:29-33`)。GL コンテキストも
+    torch 推論も呼び出しスレッドに束縛される。
+
+    引数は非破壊: 渡された `MeshData` とその配列を書き換えず、新しい配列だけを返す。
+    """
+
+    __slots__ = (
+        "_closed",
+        "_proposer",
+        "_renderer_factory",
+        "angle_deg",
+        "assign_ratio",
+        "assigned_warn",
+        "max_masks_per_view",
+        "merge_threshold",
+        "min_faces",
+        "min_votes",
+        "n_views",
+        "projection",
+        "visible_warn",
+    )
+
+    def __init__(
+        self,
+        proposer: MaskProposer,
+        renderer_factory: Callable[[MeshData], MeshRenderer],
+        *,
+        n_views: int = DEFAULT_N_VIEWS,
+        projection: str = DEFAULT_PROJECTION,
+        assign_ratio: float = fusion.DEFAULT_ASSIGN_RATIO,
+        min_votes: int = fusion.DEFAULT_MIN_VOTES,
+        merge_threshold: float = fusion.DEFAULT_MERGE_THRESHOLD,
+        angle_deg: float = fusion.DEFAULT_ANGLE_DEG,
+        min_faces: int | None = None,
+        visible_warn: float = fusion.DEFAULT_VISIBLE_WARN,
+        assigned_warn: float = fusion.DEFAULT_ASSIGNED_WARN,
+        max_masks_per_view: int = fusion.DEFAULT_MAX_MASKS_PER_VIEW,
+    ) -> None:
+        """パラメータを**構築時に**検証して保持する(fail-fast)。
+
+        Args:
+            proposer: マスク提案器。**所有する**(`close()` を呼ぶ)。
+            renderer_factory: `mesh` から `MeshRenderer` を作る callable。
+                `segment()` が `with factory(mesh) as renderer:` で使う。
+                解像度・色付けはこの callable が閉じ込める(`DEFAULT_IMAGE_SIZE` /
+                `DEFAULT_SHADING` の WHY コメント参照)。
+            n_views: 視点数(既定 24)。
+            projection: `"perspective"` / `"orthographic"`(既定は前者 — 裁定3)。
+            assign_ratio: 段階A の占有率しきい値(`(0, 1]`、判定は `>=`)。
+            min_votes: 観測辺とみなす最小票数(1 以上、既定 2)。**`n_views` 以下で
+                なければならない**(超えるとどの辺も観測されず幾何プライアだけに
+                なるため — 下のガード参照)。
+            merge_threshold: パス1 の結合しきい値(`[0, 1]`、判定は `>=`)。
+            angle_deg: 幾何プライアの二面角しきい値(`(0, 180]`)。
+            min_faces: 小部位マージのしきい値。`None` なら `max(2, M // 100)`。
+            visible_warn: 可視面率の警告しきい値。
+            assigned_warn: 可視面のうち割当を得た率の警告しきい値。
+            max_masks_per_view: 1 視点あたりのマスク数上限(超過は `ValueError`)。
+
+        Raises:
+            ValueError: いずれかのパラメータが範囲外・型違いのとき、または
+                `min_votes > n_views`(構造的に ML が寄与できない組み合わせ)のとき。
+        """
+        # `n_views` / `projection` は `cameras` 側の述語と同じものを先に適用する。
+        # 実際に使うのは `segment()` 内の `build_cameras` だが、構築時に落とせる
+        # ものは構築時に落とす(不正な設定のまま数分のレンダを始めない)。
+        if isinstance(n_views, bool) or not isinstance(n_views, (int, np.integer)):
+            raise ValueError(f"n_views must be an int, got {type(n_views).__name__}")
+        if int(n_views) < 1:
+            raise ValueError(f"n_views must be >= 1, got {n_views}")
+        if projection not in PROJECTIONS:
+            raise ValueError(
+                f"unknown projection {projection!r}, expected one of "
+                f"{list(PROJECTIONS)}"
+            )
+        self.n_views: int = int(n_views)
+        self.projection: str = projection
+        # 融合側のパラメータは `fusion` の検証関数を通す(同じ述語を 2 箇所に
+        # 書かない — `fusion` 内の各段も同じ関数で自衛している)。
+        self.assign_ratio: float = fusion.validate_assign_ratio(assign_ratio)
+        self.min_votes: int = fusion.validate_min_votes(min_votes)
+        # **2 つのパラメータの関係も見る**(2026-07-30 反証レビュー B2): 1 つの辺が
+        # 得られる票の上限は視点数なので、`min_votes > n_views` では**どの辺も
+        # 観測辺になれず**、出力は必ず `DihedralSegmenter` と同一になる。ML を
+        # 指定したのに幾何しか働かない設定を黙って受けない(例: 既定 `min_votes=2`
+        # のまま `n_views=1` を渡す)。実行時に同じ結末へ落ちる別経路
+        # (マスクが票に届かない等)は `fusion._warn_if_nothing_observed` が警告する。
+        if self.min_votes > self.n_views:
+            raise ValueError(
+                f"min_votes={self.min_votes} exceeds n_views={self.n_views}: an edge "
+                "can never collect more votes than there are views, so no edge would "
+                "ever be observed and the result would be the geometric prior alone. "
+                "Lower min_votes (1 disables the guard against single-view errors) or "
+                "raise n_views."
+            )
+        self.merge_threshold: float = fusion.validate_merge_threshold(merge_threshold)
+        self.angle_deg: float = validate_angle_deg(angle_deg)
+        self.min_faces: int | None = fusion.validate_min_faces(min_faces)
+        self.visible_warn: float = fusion.validate_warn_ratio(
+            visible_warn, "visible_warn"
+        )
+        self.assigned_warn: float = fusion.validate_warn_ratio(
+            assigned_warn, "assigned_warn"
+        )
+        self.max_masks_per_view: int = fusion.validate_max_masks_per_view(
+            max_masks_per_view
+        )
+        self._proposer = proposer
+        self._renderer_factory = renderer_factory
+        self._closed = False
+
+    def __enter__(self) -> MultiViewSegmenter:
+        """`proposer` を閉じる責任を引き受ける。閉じ済みなら `RuntimeError`。"""
+        if self._closed:
+            raise RuntimeError(
+                "this MultiViewSegmenter has been closed; its mask proposer is "
+                "already released, so it cannot be entered again. Build a new "
+                "segmenter (make_sam2_segmenter reloads the weights)."
+            )
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        """`close()` を呼ぶ(例外は握り潰さない)。"""
+        self.close()
+
+    def close(self) -> None:
+        """所有する `proposer` を解放する。**冪等**(2 回目以降は無操作)。
+
+        `proposer.close()` が例外を投げても「閉じた」状態は維持する(閉じ済みの
+        フラグを先に立てる) — 再試行して二重解放を起こすより、1 回で確定させて
+        例外を呼び出し側へ伝える方が安全。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._proposer.close()
+
+    def segment(self, mesh: MeshData) -> np.ndarray:
+        """面ごとの部位ラベルを返す(視点をストリーミングして融合する)。
+
+        視点ごとに `render -> propose -> 段階A` を回し、保持するのは
+        `view_segment (V, M) int32` と `view_visible (V, M) bool` だけ
+        (計画v4 §2.4.6)。画像は 1 視点ぶんしかメモリに載らない。
+
+        Args:
+            mesh: 分割対象。`vertices` / `faces` を読み、レンダラへそのまま渡す。
+                書き換えない。
+
+        Returns:
+            `(M,) int64`、値は `0..P-1` の連番。面数 0 のメッシュには `(0,)` を
+            返す(レンダラも生成しない)。
+
+        Raises:
+            RuntimeError: `close()` / `__exit__` の後に呼ばれたとき。
+            ValueError: 面数が 24bit 面IDの上限を超えるとき、カメラが全頂点を
+                収められないとき、注入されたレンダラ/提案器の出力が契約
+                (shape・dtype・`coverage <=> face_id >= 0`)を破っているとき、
+                または算出したラベルが契約を満たさないとき。
+        """
+        if self._closed:
+            raise RuntimeError(
+                "this MultiViewSegmenter has been closed; its mask proposer is "
+                "already released so segment() cannot run. Note that entering the "
+                "context manager is optional (an unentered segmenter works), but "
+                "leaving it is final."
+            )
+        vertices = np.asarray(mesh.vertices, dtype=np.float64)
+        faces = np.asarray(mesh.faces, dtype=np.int64)
+        n_faces = int(faces.shape[0])
+        if n_faces == 0:
+            # 面が無ければ描くものも投票するものも無い。レンダラを起こさずに返す
+            # (GL コンテキストの生成は失敗しうる副作用なので、無駄には踏まない)。
+            return np.zeros(0, dtype=np.int64)
+        validate_face_count(n_faces)
+
+        cameras = build_cameras(
+            vertices, n_views=self.n_views, projection=self.projection
+        )
+        view_segment = np.full(
+            (len(cameras), n_faces), fusion.UNASSIGNED, dtype=np.int32
+        )
+        view_visible = np.zeros((len(cameras), n_faces), dtype=bool)
+        total_masks = 0
+        # renderer は mesh に束縛されるので `segment()` ごとに生成・破棄する
+        # (§2.1 / §0-A 条件9)。例外経路でも `__exit__` を必ず通す。
+        with self._renderer_factory(mesh) as renderer:
+            for camera in cameras:
+                view = renderer.render_view(camera)
+                context = f"view {camera.index}"
+                masks = fusion.normalize_masks(
+                    self._proposer.propose(view),
+                    max_masks_per_view=self.max_masks_per_view,
+                    context=context,
+                )
+                total_masks += int(masks.shape[0])
+                assignment = fusion.assign_view_faces(
+                    masks,
+                    view.face_id,
+                    view.coverage,
+                    n_faces=n_faces,
+                    assign_ratio=self.assign_ratio,
+                    context=context,
+                )
+                view_segment[camera.index] = assignment.segment
+                view_visible[camera.index] = assignment.visible
+                _LOGGER.info(
+                    "view %d/%d: %d mask(s), %d/%d faces assigned",
+                    camera.index + 1,
+                    len(cameras),
+                    masks.shape[0],
+                    int((assignment.segment >= 0).sum()),
+                    n_faces,
+                )
+        if total_masks == 0:
+            # §2.6: ML が 1 枚もマスクを出さなかったとき。結果は幾何バックエンド
+            # 相当になる(全辺 votes=0 → パス2-1 のみ)ので、黙って「ML で分割
+            # した」ことにしない。
+            warnings.warn(
+                "the mask proposer returned no masks for any of the "
+                f"{len(cameras)} views, so this segmentation is the geometric "
+                "prior alone (identical to DihedralSegmenter with the same "
+                "angle_deg/min_faces). Check the proposer thresholds, or use "
+                "`--segmenter geometric` deliberately.",
+                stacklevel=2,
+            )
+        return fusion.fuse_view_segments(
+            vertices,
+            faces,
+            view_segment,
+            view_visible,
+            angle_deg=self.angle_deg,
+            min_votes=self.min_votes,
+            merge_threshold=self.merge_threshold,
+            min_faces=self.min_faces,
+            visible_warn=self.visible_warn,
+            assigned_warn=self.assigned_warn,
+        )

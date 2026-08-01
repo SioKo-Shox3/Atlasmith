@@ -7,12 +7,14 @@ aperiodic/face_id)を提供する。Phase 1(bake)のテストからも共用す�
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from typing import Callable
 
 import numpy as np
 import pytest
 import trimesh
 
+from atlasmith.segmentation.multiview import Camera, RenderedView
 from atlasmith.types import MeshData
 
 # Phase 1 (bake, quantize8=False) 用の許容誤差定数。Step 0-4 の io テストは
@@ -955,3 +957,258 @@ def rasterize_screen_zbuffer() -> Callable[..., tuple[np.ndarray, np.ndarray]]:
 @pytest.fixture
 def faceid_interior_mask() -> Callable[..., np.ndarray]:
     return _faceid_interior_mask
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Step 2-4: 融合ゲートの fixture とスタブ(計画v4 §5 Step 2-4 / §2.4.4)
+#
+# 既存の fixture / ヘルパ / 定数は 1 行も変更していない(以下はすべて追加)。
+#
+# ここに置くもの:
+#   - `peanut_mesh` — 鋭い折れ目を持たない滑らかな 2 膨らみ(**numpy のみ**で生成)。
+#     Step 2-4 では「幾何プライア単独では P==1 に退化する」前提の実証に使い、
+#     Step 2-5 の主 ML ゲートでもそのまま使う(計画v4 §5 Step 2-4 の ★ 節)。
+#   - `_StaticRenderer` / `_StaticMaskProposer` — 合成 `RenderedView` と固定マスクを
+#     返すスタブ(§2.4.4)。これで `MultiViewSegmenter.segment()` 全体を GPU 無しで
+#     厳密ゲートにかけられる。
+#   - 帯状の合成面IDバッファ生成(`_build_block_view` / `_masks_from_face_groups`)。
+# ---------------------------------------------------------------------------
+
+# `peanut_mesh` の極座標グリッド解像度と半径のうねり(計画v4 §5 Step 2-4)。
+_PEANUT_N_THETA = 48
+_PEANUT_N_PHI = 64
+_PEANUT_BULGE = 0.35
+
+
+def _build_peanut_geometry(
+    n_theta: int = _PEANUT_N_THETA, n_phi: int = _PEANUT_N_PHI
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """`r(theta) = 1 + 0.35*cos(2*theta)` の回転面を極座標グリッドで張る。
+
+    theta in [0, pi] / phi in [0, 2pi]。UV は `u = phi/2pi`, `v = theta/pi` なので、
+    **phi = 2pi の列と theta = 0/pi の極は頂点を複製する**(u/v が別値になるため
+    1 頂点では表せない — glTF が UV シームで頂点を複製するのと同じ事情)。
+
+    **位置を「ビット厳密に」一致させている WHY**: 複製頂点は
+    `segmentation.adjacency.weld_vertices` が**厳密一致**でしか畳まない
+    (許容誤差 weld を持たないのが設計)。素朴に `np.sin(theta)` を使うと
+    `sin(pi) = 1.22e-16 != 0` なので南極の 65 頂点が微妙に別位置になり、
+    `np.sin(2*pi) = -2.45e-16 != 0` なのでシーム列も畳まれない。実測(2026-07-29):
+    weld 後の頂点が 3010 ではなく **3121**、辺が 9024 ではなく **8913** になり、
+    閉多様体でなくなる。そこで極の `sin` と `cos`、シーム列の `sin`/`cos` を
+    **解析値で上書き**してから座標を組む。
+
+    極の三角形は**扇状に 1 枚**だけ張る(退化四角形を 2 分割しない)。weld 後に
+    2 corner が同一頂点へ潰れる面は `build_face_adjacency` が
+    「位置的縮退面」として 3 辺すべてを隣接から外すため、素朴に 2 枚張ると
+    極の周囲が全カットされ、`DihedralSegmenter` が P==1 に退化しなくなる。
+
+    巻き順は全面**外向き**(`(dP/dtheta) x (dP/dphi)` が外向き法線)。
+    `dihedral_angles` は符号なし角なので、巻き順が混ざると同一平面でも 180 度と
+    評価され過分割される(`adjacency.py` の既知の限界)。
+
+    Returns:
+        `(vertices (N, 3) float64, faces (M, 3) int64, uv (N, 2) float32)`。
+    """
+    theta = np.linspace(0.0, np.pi, n_theta + 1)
+    phi = np.linspace(0.0, 2.0 * np.pi, n_phi + 1)
+    cos_theta, sin_theta = np.cos(theta), np.sin(theta)
+    # 極: sin = 0 / cos = +-1 を解析値で固定する(上の WHY 参照)。
+    sin_theta[0], sin_theta[-1] = 0.0, 0.0
+    cos_theta[0], cos_theta[-1] = 1.0, -1.0
+    cos_phi, sin_phi = np.cos(phi), np.sin(phi)
+    # シーム: phi = 2pi は phi = 0 と同一点。
+    cos_phi[-1], sin_phi[-1] = cos_phi[0], sin_phi[0]
+    # cos(2t) = 2cos^2(t) - 1 で組むと、極(cos t = +-1)の半径が両端で厳密に一致する。
+    radius = 1.0 + _PEANUT_BULGE * (2.0 * cos_theta * cos_theta - 1.0)
+    x = (radius * sin_theta)[:, np.newaxis] * cos_phi[np.newaxis, :]
+    y = (radius * sin_theta)[:, np.newaxis] * sin_phi[np.newaxis, :]
+    z = np.broadcast_to((radius * cos_theta)[:, np.newaxis], x.shape)
+    vertices = np.stack([x.ravel(), y.ravel(), z.ravel()], axis=1)
+    uv = np.stack(
+        [
+            np.broadcast_to((phi / (2.0 * np.pi))[np.newaxis, :], x.shape).ravel(),
+            np.broadcast_to((theta / np.pi)[:, np.newaxis], x.shape).ravel(),
+        ],
+        axis=1,
+    ).astype(np.float32)
+
+    stride = n_phi + 1
+    faces: list[list[int]] = []
+    for row in range(n_theta):
+        for col in range(n_phi):
+            corner_a = row * stride + col  # (theta_i,   phi_j)
+            corner_b = row * stride + col + 1  # (theta_i,   phi_j+1)
+            corner_c = (row + 1) * stride + col + 1  # (theta_i+1, phi_j+1)
+            corner_d = (row + 1) * stride + col  # (theta_i+1, phi_j)
+            if row < n_theta - 1:
+                # 南極の帯では c と d が同一点なので張らない。
+                faces.append([corner_a, corner_d, corner_c])
+            if row > 0:
+                # 北極の帯では a と b が同一点なので張らない。
+                faces.append([corner_a, corner_c, corner_b])
+    return vertices, np.array(faces, dtype=np.int64), uv
+
+
+def _peanut_truth_labels(mesh: MeshData) -> np.ndarray:
+    """`peanut_mesh` の真値ラベル = 面重心の z の符号(計画v4 §5 Step 2-4)。
+
+    北の膨らみ = 0 / 南の膨らみ = 1。くびれ(z = 0)を跨ぐ面が無いことは
+    fixture の前提ゲートで確認する(重心 z の最小絶対値は約 0.0142)。
+    """
+    centroids = np.asarray(mesh.vertices)[np.asarray(mesh.faces)].mean(axis=1)
+    return (centroids[:, 2] < 0.0).astype(np.int64)
+
+
+@pytest.fixture
+def peanut_mesh() -> MeshData:
+    """くびれた 2 つの膨らみを持つ滑らかな閉曲面(6016 面 / 位置weld 後 3010 頂点)。
+
+    **設計意図**(計画v4 §5 Step 2-4): 接合部に鋭い折れ目が無いので
+    **幾何プライア単独では P==1 に退化する**。多視点 ML が幾何に勝てるかを見る
+    ための土俵であり、Step 2-4 ではその前提(P==1)自体をゲートで実証する。
+    """
+    vertices, faces, uv = _build_peanut_geometry()
+    return MeshData(
+        vertices=vertices,
+        faces=faces,
+        uv=uv,
+        maps={},
+        source_vertex=np.arange(len(vertices), dtype=np.int64),
+    )
+
+
+@pytest.fixture
+def peanut_truth_labels() -> Callable[[MeshData], np.ndarray]:
+    return _peanut_truth_labels
+
+
+# 合成ビューで 1 面に割り当てる正方ブロックの一辺(画素)。4 なら 1 面 16 画素で、
+# `assign_ratio` の既定 0.5 に対して十分な粒度がある。
+_BLOCK_SIZE = 4
+
+
+def _build_block_view(n_faces: int, *, block: int = _BLOCK_SIZE) -> RenderedView:
+    """面 f を幅 `block` の縦帯へ写す合成 `RenderedView` を組む。
+
+    画像は `(block + 2, n_faces * block + 2)`。**外周 1 画素は背景**にしてあるので、
+    `coverage` が全 True の退化した入力にならない(段階A の背景除外が空虚な検査に
+    ならないようにするため)。`color` は融合経路が読まないので 0 で埋める
+    (色を読むのは `MaskProposer` だけ)。
+
+    `coverage <=> (face_id >= 0)` は `RenderedView` の契約であり、`assign_view_faces`
+    が `validate_coverage_consistency` で実際に検査する。
+
+    Args:
+        n_faces: メッシュの面数 M(全面が 1 画素以上写る)。
+        block: 1 面あたりのブロックの一辺。
+
+    Returns:
+        `RenderedView(face_id (H, W) int32, color (H, W, 3) uint8, coverage bool)`。
+    """
+    height = block + 2
+    width = n_faces * block + 2
+    face_id = np.full((height, width), -1, dtype=np.int32)
+    for face in range(n_faces):
+        face_id[1 : 1 + block, 1 + face * block : 1 + (face + 1) * block] = face
+    coverage = face_id >= 0
+    color = np.zeros((height, width, 3), dtype=np.uint8)
+    return RenderedView(face_id=face_id, color=color, coverage=coverage)
+
+
+def _masks_from_face_groups(
+    face_id: np.ndarray, groups: Sequence[Iterable[int]]
+) -> np.ndarray:
+    """面 index の集合ごとに 1 枚のマスクを作る `(K, H, W) bool`。
+
+    どのグループにも入らない面の画素はどのマスクにも入らない = 段階A で
+    `UNASSIGNED` になる。これで「その視点では観測されなかった面」を作れる。
+    """
+    ids = np.asarray(face_id)
+    masks = np.zeros((len(groups), *ids.shape), dtype=bool)
+    for index, group in enumerate(groups):
+        wanted = np.array(sorted(set(int(face) for face in group)), dtype=np.int64)
+        masks[index] = np.isin(ids, wanted)
+    return masks
+
+
+class _StaticRenderer:
+    """`MeshRenderer` 契約を満たす合成レンダラ(視点ごとの `RenderedView` を返す)。
+
+    **未入場 / 退場後の `render_view` を `RuntimeError` にしてある WHY**:
+    `_ModernglRenderer` と同じ 3 状態(未入場・入場中・退場後)を再現することで、
+    「`segment()` が本当に `with` で囲んでいるか」が検査できる。囲んでいなければ
+    このスタブが即座に落ちる(2026-07-29 裁定1: `__enter__`/`__exit__` を呼ぶのは
+    `segment()` 側)。`enter_count` / `exit_count` で回数も観測できる。
+    """
+
+    def __init__(self, views: Sequence[RenderedView]) -> None:
+        self._views = list(views)
+        self._state = "new"
+        self.enter_count = 0
+        self.exit_count = 0
+        self.render_count = 0
+
+    def __enter__(self) -> _StaticRenderer:
+        if self._state != "new":
+            raise RuntimeError(f"_StaticRenderer cannot be re-entered ({self._state})")
+        self._state = "open"
+        self.enter_count += 1
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self._state = "closed"
+        self.exit_count += 1
+
+    def render_view(self, camera: Camera) -> RenderedView:
+        if self._state != "open":
+            raise RuntimeError(
+                f"_StaticRenderer.render_view called while {self._state}; the caller "
+                "must wrap it in `with renderer_factory(mesh) as renderer:`"
+            )
+        self.render_count += 1
+        return self._views[camera.index]
+
+
+class _StaticMaskProposer:
+    """`MaskProposer` 契約を満たす固定マスク提案器(視点順に 1 組ずつ返す)。
+
+    `propose` は呼ばれた順に `masks_per_view[i]` を返す — `RenderedView` には視点
+    index が入っていないので、**呼び出し順が視点順であること**を前提にする
+    (`segment()` はカメラを `index` 昇順に回す)。`K = 0`(空 `(0, H, W)`)も渡せる。
+    """
+
+    def __init__(self, masks_per_view: Sequence[np.ndarray]) -> None:
+        self._masks_per_view = list(masks_per_view)
+        self.propose_count = 0
+        self.close_count = 0
+
+    def propose(self, view: RenderedView) -> np.ndarray:
+        if self.close_count:
+            raise RuntimeError("_StaticMaskProposer.propose called after close()")
+        masks = self._masks_per_view[self.propose_count]
+        self.propose_count += 1
+        return masks
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+@pytest.fixture
+def build_block_view() -> Callable[..., RenderedView]:
+    return _build_block_view
+
+
+@pytest.fixture
+def masks_from_face_groups() -> Callable[..., np.ndarray]:
+    return _masks_from_face_groups
+
+
+@pytest.fixture
+def static_renderer() -> Callable[..., _StaticRenderer]:
+    return _StaticRenderer
+
+
+@pytest.fixture
+def static_mask_proposer() -> Callable[..., _StaticMaskProposer]:
+    return _StaticMaskProposer

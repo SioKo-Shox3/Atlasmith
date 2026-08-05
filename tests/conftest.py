@@ -1212,3 +1212,42 @@ def static_renderer() -> Callable[..., _StaticRenderer]:
 @pytest.fixture
 def static_mask_proposer() -> Callable[..., _StaticMaskProposer]:
     return _StaticMaskProposer
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Step 2-5: SAM2 / thickness ゲート用の追加 fixture
+#
+# 既存の fixture / ヘルパ / 定数は 1 行も変更していない(以下はすべて追加)。
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def peanut_mesh_module() -> MeshData:
+    """`peanut_mesh` の module スコープ版(Step 2-5 オーケストレーター裁定F)。
+
+    SAM2 の `segment()` は 1 回数分かかるため、`tests/test_multiview_sam2.py` の
+    module スコープ結果 fixture がこのメッシュを 1 回だけ組んで共有する
+    (function スコープの `peanut_mesh` に依存できないのは pytest のスコープ
+    規則)。既存 fixture と別名なのは「テストごとに新しい配列」という既存の
+    性質を変えないため。**共有インスタンスなので読み取り専用として扱うこと**
+    (production の引数非破壊契約と同じ)。
+    """
+    vertices, faces, uv = _build_peanut_geometry()
+    return MeshData(
+        vertices=vertices,
+        faces=faces,
+        uv=uv,
+        maps={},
+        source_vertex=np.arange(len(vertices), dtype=np.int64),
+    )
+
+
+@pytest.fixture
+def build_peanut_geometry() -> Callable[..., tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """解像度 `(n_theta, n_phi)` を指定して peanut ジオメトリを組むヘルパ。
+
+    Step 2-5 が 2 用途で使う: (a) thickness のスケーリング比ゲートが「同型で
+    規模だけ違う」メッシュ対を要する、(b) SAM2 の多視点疎通ゲートが小さめの
+    2 色ダンベル(peanut + 2 色テクスチャ)を要する。
+    """
+    return _build_peanut_geometry

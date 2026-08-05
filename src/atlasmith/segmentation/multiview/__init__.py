@@ -1,9 +1,9 @@
 """多視点(SAM2)部位分割バックエンドの公開境界と寿命契約。
 
-この時点(Step 2-4)で公開するのは**データ契約・Protocol・決定的バックエンド**:
+公開するのは**データ契約・Protocol・決定的バックエンド**:
 `Camera` / `RenderedView` / `MeshRenderer` / `MaskProposer` /
-`MultiViewSegmenter`。SAM2 アダプタ(`sam2_masks.py`)と、それを束ねる
-`make_sam2_segmenter()` は Step 2-5 で追加される。
+`MultiViewSegmenter`、および SAM2 アダプタ(`sam2_masks.py`、Step 2-5)を
+束ねるファクトリ `make_sam2_segmenter()`。
 
 **`render` / `sam2_masks` をここで import しない**(計画v4 §2.1 規約2)。
 どちらも第三者 GL/ML ライブラリを触る隔離モジュールで、module 直下 import が
@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import warnings
 from types import TracebackType
-from typing import Callable, NamedTuple, Protocol
+from typing import Any, Callable, NamedTuple, Protocol
 
 import numpy as np
 
@@ -47,6 +47,7 @@ __all__ = [
     "MeshRenderer",
     "MultiViewSegmenter",
     "RenderedView",
+    "make_sam2_segmenter",
 ]
 
 _LOGGER = logging.getLogger(__name__)
@@ -442,3 +443,51 @@ class MultiViewSegmenter:
             visible_warn=self.visible_warn,
             assigned_warn=self.assigned_warn,
         )
+
+
+def make_sam2_segmenter(**kwargs: Any) -> MultiViewSegmenter:
+    """SAM2 自動マスク生成を結線した `MultiViewSegmenter` を作る(Step 2-5)。
+
+    戻り値は proposer(= SAM2 の重み)を**所有する** context manager なので、
+    使い終わったら `with` か `close()` で必ず閉じること:
+
+        with make_sam2_segmenter() as segmenter:
+            labels = segmenter.segment(mesh)
+
+    パラメータはすべてキーワードで `sam2_masks.build_sam2_segmenter` へ透過する。
+    主なもの(既定値と実測根拠は `sam2_masks.py` の `DEFAULT_*` を参照):
+
+      - `model_id`(既定 `"facebook/sam2.1-hiera-large"`)/ `device`(既定は
+        cuda 自動判定、cpu へ落ちるとき `UserWarning`)
+      - `pred_iou_thresh` / `stability_score_thresh`(AMG の閾値 — 既定 0.5 / 0.7)
+      - `crop_n_layers`: **0 のみ受理**(既定 0)。非 0 は AMG が
+        `point_grids[crop_layer]` を引くのに対し、この proposer が視点ごとに
+        グリッドを 1 つしか差し替えないため成立しない — 入口で `ValueError`。
+      - `grid_side`(シルエット内点グリッド)/ `area_band` / `channels`
+        (既定 `("sdf", "shading")` — SDF チャンネルが品質の主因)
+      - `image_size` / `shading`(renderer_factory へ焼き込む —
+        `DEFAULT_IMAGE_SIZE` / `DEFAULT_SHADING` の WHY コメント参照)
+      - ほかは `MultiViewSegmenter.__init__` の引数(`n_views` 等)へ透過。
+
+    **検証済みなのは既定パラメータだけ**: `n_views` / `image_size` を既定より
+    下げると構築時に `UserWarning` が出る(禁止はしない)。実測では
+    `n_views=8` 単独・`image_size=512` 単独のどちらでも accuracy が 0.9574 →
+    0.5000(P=1)へ崩れ、幾何プライアと同値になった。結果が単一部位になった
+    ときも `segment()` が `UserWarning` を出す。
+
+    Raises:
+        ImportError: torch / sam2 が未導入のとき。メッセージが
+            `uv sync --extra ml` / `pip install "atlasmith[ml]"` /
+            `--segmenter geometric` の 3 経路を提示する。
+        ValueError: パラメータが契約外のとき(`crop_n_layers != 0` を含む)。
+
+    **WHY 本体が `sam2_masks.py` で、ここは委譲だけか**: `sam2_masks` は隔離
+    モジュール2(計画v4 §2.1)。module 直下で import すると
+    `import atlasmith.segmentation.multiview` だけで隔離ファイルが読み込まれ、
+    「重い依存に触るコードは要るときだけ触る」境界が崩れる(torch 自体は
+    遅延 import でも、境界の規約はファイル単位で守る — 冒頭 docstring と
+    `tests/test_import_isolation.py` 参照)。だから import は**この関数の中**。
+    """
+    from atlasmith.segmentation.multiview import sam2_masks
+
+    return sam2_masks.build_sam2_segmenter(**kwargs)

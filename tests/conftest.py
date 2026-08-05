@@ -1251,3 +1251,85 @@ def build_peanut_geometry() -> Callable[..., tuple[np.ndarray, np.ndarray, np.nd
     2 色ダンベル(peanut + 2 色テクスチャ)を要する。
     """
     return _build_peanut_geometry
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Step 2-6: UV アイランド分解ヘルパ(独立オラクル)
+#
+# 既存の fixture / ヘルパ / 定数は 1 行も変更していない(以下はすべて追加)。
+#
+# WHY conftest に置くか: Step 2-7 の E2E(CLI 出力 GLB を読み戻しての島整合検査)が
+# 同じ分解を再利用する(計画v4 §5 Step 2-6 のファイル指定 / v2 BL-8)。
+#
+# WHY production を呼ばないか: これは `pack/part_pack.py` の不変条件
+# (`_face_islands` / `_check_island_part_consistency`)に対する**独立オラクル**
+# である。production の実装を呼べば「実装が自分自身に一致する」ことしか言えず、
+# ゲートが空虚になる。よってアルゴリズムを意図的に別に組む:
+#   - 接続の取り方: production は corner を頂点で argsort してグループ化する。
+#     こちらは dict による「頂点 → 最初に見た面」の逆引きだけを持つ。
+#   - union のルール: production は「常に小さい根を親」。こちらは union by size。
+#   - 出力の番号: production は「成分内の最小面 index」。こちらは最初に現れた
+#     順の 0..K-1 連番。
+# 同じ連結成分に落ち着くことだけが両者の共通点であり、実装の一致は無い。
+# ---------------------------------------------------------------------------
+
+
+def _uv_island_labels(faces: np.ndarray) -> np.ndarray:
+    """面 `(M, 3)` を「頂点 index の共有」で連結成分(UV アイランド)へ分ける。
+
+    xatlas はシームで頂点を分割するので、新メッシュにおいて「頂点を共有する面」の
+    連結成分がそのまま 1 つの UV アイランド(チャート)になる。
+
+    Args:
+        faces: 面 `(M, 3)`(頂点 index)。**書き換えない**。
+
+    Returns:
+        `(M,) int64`。値は `0..K-1` の連番で、**成分が最初に現れる面の順**に採番
+        する(面の並びだけで決まるので一意)。
+
+    Raises:
+        ValueError: `faces` の shape が `(M, 3)` でないとき。
+    """
+    face_array = np.asarray(faces)
+    if face_array.ndim != 2 or face_array.shape[1] != 3:
+        raise ValueError(f"faces must have shape (M, 3), got {face_array.shape}")
+    n_faces = int(face_array.shape[0])
+    parent = list(range(n_faces))
+    size = [1] * n_faces
+
+    def find(item: int) -> int:
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]  # 経路半圧縮
+            item = parent[item]
+        return item
+
+    def union(left: int, right: int) -> None:
+        root_left, root_right = find(left), find(right)
+        if root_left == root_right:
+            return
+        if size[root_left] < size[root_right]:  # union by size
+            root_left, root_right = root_right, root_left
+        parent[root_right] = root_left
+        size[root_left] += size[root_right]
+
+    first_face_of_vertex: dict[int, int] = {}
+    for face_index, corners in enumerate(face_array.tolist()):
+        for vertex in corners:
+            anchor = first_face_of_vertex.setdefault(vertex, face_index)
+            if anchor != face_index:
+                union(anchor, face_index)
+
+    island_of_root: dict[int, int] = {}
+    islands = np.empty(n_faces, dtype=np.int64)
+    for face_index in range(n_faces):
+        root = find(face_index)
+        if root not in island_of_root:
+            island_of_root[root] = len(island_of_root)
+        islands[face_index] = island_of_root[root]
+    return islands
+
+
+@pytest.fixture
+def uv_island_labels() -> Callable[[np.ndarray], np.ndarray]:
+    """`_uv_island_labels`(新頂点共有 union-find による UV アイランド分解)。"""
+    return _uv_island_labels

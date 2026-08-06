@@ -530,6 +530,95 @@ def test_unknown_granularity_raises(tmp_path, cube_mesh) -> None:
         rebake(source, tmp_path / "out.glb", granularity="chunky")
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"texture_size": 0}, "texture_size must be >= 1"),
+        ({"texture_size": -1}, "texture_size must be >= 1"),
+        ({"padding_px": -1}, "padding_px must be >= 0"),
+        ({"texture_size": 64.0}, "texture_size must be an int"),
+        ({"texture_size": "1024"}, "texture_size must be an int"),
+        ({"padding_px": True}, "padding_px must be an int"),
+    ],
+    ids=["zero", "negative-size", "negative-padding", "float", "str", "bool"],
+)
+def test_rebake_quarantines_texture_size_and_padding(
+    tmp_path, cube_mesh, kwargs, expected
+) -> None:
+    """★ 寸法系引数は入口で検疫する(2026-08-07 外部レビュー指摘)。
+
+    どう壊れたら落ちるか: 検疫を外すと値がそのまま xatlas 設定へ流れる。実測の
+    被害は 2 種類 — `texture_size=0` は**成功扱い**で 1450x726 のアトラスを組む
+    高コスト処理を全部やってから `(0, 0, 3)` の無効なテクスチャを出し、負値は
+    引数名も対処法も出ない生の `TypeError` になった。
+
+    出力ファイルが作られないことまで見るのは、検疫が「書き出しの後」に移動
+    しても気づけるようにするため。
+    """
+    source = tmp_path / "in.glb"
+    output = tmp_path / "out.glb"
+    save_mesh(cube_mesh, source)
+    with pytest.raises(ValueError, match=expected) as excinfo:
+        rebake(source, output, **kwargs)
+    # 行動可能: 引数名と、CLI 利用者向けのフラグ名が出る。
+    assert "rebake:" in str(excinfo.value)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("size", "padding"),
+    [(1, 0), (64, 0), (64, 4)],
+    ids=["minimum-size", "no-padding", "typical"],
+)
+def test_rebake_accepts_the_boundary_values(
+    tmp_path, cube_mesh, make_texture, size, padding
+) -> None:
+    """負の対照: 境界の合法値(`texture_size=1` / `padding_px=0`)は通す。
+
+    これが無いと「常に ValueError」でも上の検疫テストは通ってしまう。
+    `padding_px=0` はガター無しを利用者が意図的に選ぶ合法状態
+    (`rebake` の `g == 0` 警告が `padding_px > 0` を条件にしているのと同じ境界)。
+    """
+    mesh = _with_texture(cube_mesh, make_texture)
+    source = tmp_path / "in.glb"
+    output = tmp_path / "out.glb"
+    save_mesh(mesh, source)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # ガター消失警告は本テストの対象外
+        rebake(source, output, texture_size=size, padding_px=padding)
+    assert output.exists()
+    assert load_mesh(output).maps["basecolor"].shape[:2] == (size, size)
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--texture-size", "0"),
+        ("--texture-size", "-1"),
+        ("--padding", "-1"),
+        ("--texture-size", "abc"),
+    ],
+    ids=["zero", "negative-size", "negative-padding", "not-a-number"],
+)
+def test_cli_rejects_out_of_range_sizes(tmp_path, cube_mesh, flag, value) -> None:
+    """CLI 側も `argparse` で弾く(exit 2 + usage、traceback ではなく)。
+
+    `rebake` の検疫は API 直呼びの防壁で、こちらは CLI 利用者への正しい応答
+    (`_positive_int` / `_non_negative_int` の WHY)。同じ穴を 2 つの入口で塞ぐ。
+    """
+    source = tmp_path / "in.glb"
+    save_mesh(cube_mesh, source)
+    with pytest.raises(SystemExit) as excinfo:
+        main([str(source), "-o", str(tmp_path / "out.glb"), flag, value])
+    assert excinfo.value.code == 2
+
+
+def test_cli_accepts_zero_padding() -> None:
+    """負の対照: `--padding 0` は合法(0 を弾く実装なら落ちる)。"""
+    _, args = _parse(["in.glb", "-o", "out.glb", "--padding", "0"])
+    assert args.padding == 0
+
+
 def test_naive_with_segmentation_backend_raises(tmp_path, cube_mesh) -> None:
     """`granularity="naive"` + `segmentation` は `ValueError`(黙って無視しない)。"""
     source = tmp_path / "in.glb"
@@ -691,9 +780,16 @@ import sys
 class _BlockMlExtras:
     BLOCKED = {"torch", "sam2"}
 
+    # **`ModuleNotFoundError` で模す**(2026-08-07 外部レビュー対応): 本当に
+    # 未導入なら Python が投げるのはこれ(`name=` つき)であって素の
+    # `ImportError` ではない。素の `ImportError` は「導入済みだが壊れている」の
+    # 印であり、production はその 2 つを別物として扱う(`sam2_masks._is_absent`)。
+    # 不在の経路を測るテストは不在を忠実に模さなければならない。
     def find_spec(self, fullname, path=None, target=None):
         if fullname.split(".")[0] in self.BLOCKED:
-            raise ImportError(f"simulated: {fullname} is not installed")
+            raise ModuleNotFoundError(
+                f"simulated: {fullname} is not installed", name=fullname
+            )
         return None
 
 
@@ -754,22 +850,31 @@ def test_default_sam2_without_ml_warns_and_falls_back_to_geometric(
     CI(`uv sync --locked` = extras 無し)と既定 CLI パスを green に保つための裁定。
     「黙って」ではないこと(= 警告が出ること)がこのテストの主題。
 
-    ここは in-process の monkeypatch で足りる: 測るのは「`ImportError` が出たら
-    警告して geometric で続行する」という CLI の分岐であって、`ImportError` の
+    ここは in-process の monkeypatch で足りる: 測るのは「**依存が丸ごと不在**なら
+    警告して geometric で続行する」という CLI の分岐であって、例外メッセージの
     **中身**ではない(行動可能なメッセージの検証は上の subprocess テストが
     production の翻訳経路ごと担当している)。ただし理由が握り潰されていない
     ことは見る — 警告文に元の例外文が埋まっていること。
+
+    **不在は `ModuleNotFoundError` + 本体名**で模す(2026-08-07 外部レビュー
+    対応)。フォールバックの条件がその型と名前だからで、素の `ImportError` で
+    模すと「壊れたインストールでもフォールバックする」実装まで通してしまう
+    — それがまさに直した不具合である。対になる負の対照は下の
+    `test_default_sam2_with_a_broken_ml_install_is_not_swallowed`。
     """
     from atlasmith.segmentation.multiview import sam2_masks
 
     reason = "simulated: the [ml] extra is not installed"
 
-    def _missing(*_args, **_kwargs):
-        raise ImportError(reason)
+    def _absent(name):
+        def _raise(*_args, **_kwargs):
+            raise ModuleNotFoundError(reason, name=name)
+
+        return _raise
 
     # `_resolve_device`(torch)が `_import_sam2` より先に走るので両方を潰す。
-    monkeypatch.setattr(sam2_masks, "_import_torch", _missing)
-    monkeypatch.setattr(sam2_masks, "_import_sam2", _missing)
+    monkeypatch.setattr(sam2_masks, "_import_torch", _absent("torch"))
+    monkeypatch.setattr(sam2_masks, "_import_sam2", _absent("sam2"))
 
     mesh = _with_texture(cube_mesh, make_texture)
     source = tmp_path / "in.glb"
@@ -795,6 +900,74 @@ def test_default_sam2_without_ml_warns_and_falls_back_to_geometric(
     assert baked.exists()
     assert any(reason in str(w.message) for w in rec), (
         "the fallback warning must quote why the [ml] backend could not be built"
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ImportError("installed sam2 ABI mismatch: missing internal symbol"),
+        ModuleNotFoundError("No module named 'hydra'", name="hydra"),
+    ],
+    ids=["abi-mismatch", "missing-transitive-dep"],
+)
+def test_default_sam2_with_a_broken_ml_install_is_not_swallowed(
+    tmp_path, cube_mesh, make_texture, monkeypatch, failure
+) -> None:
+    """★ 既定経路でも「壊れたインストール」は幾何経路へ落とさない(裁定・2026-08-07)。
+
+    どう壊れたら落ちるか: `except ImportError` を広いまま(= 修正前)に戻した
+    瞬間。実測ではこの `failure` を注入すると **exit 0 のまま `DihedralSegmenter`
+    の成果物**が書き出され、警告は「[ml] extra is not installed」と原因を誤って
+    報告した。設計が許したのは「ML extra 未導入時のフォールバック」だけで、
+    壊れたインストールを黙って別アルゴリズムで代替することは含まない。
+
+    上の `test_default_sam2_without_ml_warns_and_falls_back_to_geometric`(不在 =
+    フォールバックする)と対になる負の対照であり、2 つで分岐の両側を押さえる。
+
+    `_import_sam2` を関数ごと差し替えるのは、ここで測るのが **CLI の分岐**
+    だからである(例外メッセージの翻訳は `tests/test_multiview_sam2.py` の
+    `test_broken_ml_install_is_not_reported_as_a_missing_extra` が production の
+    翻訳経路ごと担当する)。
+    """
+    import types
+
+    from atlasmith.segmentation.multiview import sam2_masks
+
+    monkeypatch.setattr(
+        sam2_masks,
+        "_import_torch",
+        lambda: types.SimpleNamespace(
+            cuda=types.SimpleNamespace(is_available=lambda: True)
+        ),
+    )
+
+    def _broken(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(sam2_masks, "_import_sam2", _broken)
+
+    mesh = _with_texture(cube_mesh, make_texture)
+    source = tmp_path / "in.glb"
+    baked = tmp_path / "out.glb"
+    save_mesh(mesh, source)
+
+    with pytest.raises(ImportError) as excinfo:
+        main(
+            [
+                str(source),
+                "-o",
+                str(baked),
+                "--texture-size",
+                str(_NEW_RES),
+                "--padding",
+                str(_PADDING),
+            ]
+        )
+    assert str(failure) in str(excinfo.value)
+    assert not baked.exists(), (
+        "a broken ML install must not silently produce output from a different "
+        "segmentation algorithm"
     )
 
 

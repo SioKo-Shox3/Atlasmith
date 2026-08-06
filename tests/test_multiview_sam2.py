@@ -126,6 +126,55 @@ class _CountingProposer:
         self.close_count += 1
 
 
+class _RaisingFinder:
+    """名指しした最上位パッケージの import を、指定の例外で失敗させる meta_path finder。
+
+    `sys.modules` へ `None` を差す既存の手口では表現できない状態が 2 つある:
+
+      - 「導入済みだが import に失敗する」= 素の `ImportError`(ABI 不整合)。
+      - `from sam2.x import y` に対する「**親パッケージが不在**」。`sys.modules`
+        の `sam2` を `None` にしても、import 機構は親が既に載っていると見なして
+        再 import せず、`ModuleNotFoundError(name="sam2.x", "... is not a
+        package")` になる — それは不在ではなく**破損**の署名である(実測
+        2026-08-07)。production はこの 2 つを区別するので、テスト側も区別して
+        模す必要がある。
+    """
+
+    def __init__(self, blocked: str, error: ImportError) -> None:
+        self.blocked = blocked
+        self.error = error
+
+    def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> None:
+        if fullname.split(".")[0] == self.blocked:
+            raise self.error
+        return None
+
+
+def _break_import(
+    monkeypatch: pytest.MonkeyPatch, module: str, error: ImportError
+) -> None:
+    """`import <module>` が `error` で失敗する状態を作る(monkeypatch が原状復帰)。
+
+    既に `sys.modules` に載っていると import 文は finder を通らず素通りするので、
+    **サブモジュールも含めて**エントリを外してから finder を差し込む(完全修飾名
+    が残っていると親を見に行かない)。ML テストが先に走った後でも同じ経路を踏む。
+    """
+    for name in [
+        loaded
+        for loaded in list(sys.modules)
+        if loaded == module or loaded.startswith(f"{module}.")
+    ]:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setattr(
+        sys, "meta_path", [_RaisingFinder(module, error), *sys.meta_path]
+    )
+
+
+def _absent(module: str) -> ModuleNotFoundError:
+    """「そのパッケージがそもそも入っていない」ときに Python が投げる形の例外。"""
+    return ModuleNotFoundError(f"No module named {module!r}", name=module)
+
+
 # ---------------------------------------------------------------------------
 # 非 ML 1: 未導入エラー経路(ゲート1)
 # ---------------------------------------------------------------------------
@@ -150,12 +199,85 @@ def test_missing_torch_raises_an_actionable_import_error(
 def test_missing_sam2_raises_an_actionable_import_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """torch はあるが sam2 が無い環境でも同じ 3 経路が案内される。"""
+    """torch はあるが sam2 が無い環境でも同じ 3 経路が案内される。
+
+    **simulation を `sys.modules` 汚染から finder へ替えた**(2026-08-07 外部
+    レビュー対応): production が不在と破損を区別するようになったので、不在を
+    測るこのテストは不在を**忠実に**模す必要がある。`sys.modules` 経由では
+    `from sam2.x import y` に対して不在の署名(`name="sam2"`)を作れない —
+    理由は `_RaisingFinder` の docstring。
+    """
     monkeypatch.setattr(sam2_masks, "_import_torch", lambda: _fake_torch(True))
-    monkeypatch.setitem(sys.modules, "sam2", None)
-    monkeypatch.setitem(sys.modules, "sam2.automatic_mask_generator", None)
+    _break_import(monkeypatch, "sam2", _absent("sam2"))
     with pytest.raises(ImportError) as excinfo:
         make_sam2_segmenter()
+    for phrase in _INSTALL_PHRASES:
+        assert phrase in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ImportError("installed sam2 ABI mismatch: missing internal symbol"),
+        ModuleNotFoundError("No module named 'hydra'", name="hydra"),
+    ],
+    ids=["abi-mismatch", "missing-transitive-dep"],
+)
+@pytest.mark.parametrize("module", ["torch", "sam2"])
+def test_broken_ml_install_is_not_reported_as_a_missing_extra(
+    monkeypatch: pytest.MonkeyPatch, module: str, failure: ImportError
+) -> None:
+    """★ 「壊れたインストール」を「extra 未導入」と混同しない(2 分岐の片方)。
+
+    どう壊れたら落ちるか: `_import_torch` / `_import_sam2` が失敗の**種類**を見ずに
+    「未導入です、`uv sync --extra ml` してください」と翻訳する実装(= 修正前)に
+    戻した瞬間。そのとき CLI の既定経路は広い `except ImportError` でこれを掴み、
+    **exit 0 のまま幾何バックエンドの成果物**を出して原因も誤って報告していた。
+
+    2 つの `failure` は現実の壊れ方の代表: ABI 不整合(素の `ImportError`)と
+    推移的依存の欠落(**`ModuleNotFoundError` だが名前が本体ではない**)。後者が
+    あるので、型だけを見て名前を見ない実装でも落ちる。
+    """
+    if module == "sam2":  # torch 側は成立させて sam2 の分岐まで到達させる
+        monkeypatch.setattr(sam2_masks, "_import_torch", lambda: _fake_torch(True))
+    _break_import(monkeypatch, module, failure)
+
+    with pytest.raises(ImportError) as excinfo:
+        make_sam2_segmenter()
+
+    message = str(excinfo.value)
+    assert not isinstance(excinfo.value, ModuleNotFoundError), (
+        "a broken install must not masquerade as an absent module; the CLI keys "
+        "its default fallback off exactly that type"
+    )
+    assert f"{module} is installed but importing it failed" in message
+    assert str(failure) in message  # 元の理由を握り潰さない
+    # 不在の案内は出さない(打つ手が違う)。
+    assert "uv sync --extra ml" not in message
+    assert 'pip install "atlasmith[ml]"' not in message
+    # 代わりに修復と回避の手を示す。
+    assert "uv sync --reinstall --extra ml" in message
+    assert "--segmenter geometric" in message
+
+
+@pytest.mark.parametrize("module", ["torch", "sam2"])
+def test_absent_ml_package_is_a_named_module_not_found_error(
+    monkeypatch: pytest.MonkeyPatch, module: str
+) -> None:
+    """負の対照: **本体が不在**なら `ModuleNotFoundError` + 本体名 + 3 経路。
+
+    CLI の既定フォールバックはこの型と名前だけを条件にする
+    (`cli._is_missing_ml_extra`)ので、ここが崩れると「[ml] 未導入なら
+    geometric で続行」という裁定 E の経路自体が死ぬ。
+    """
+    if module == "sam2":
+        monkeypatch.setattr(sam2_masks, "_import_torch", lambda: _fake_torch(True))
+    _break_import(monkeypatch, module, _absent(module))
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        make_sam2_segmenter()
+
+    assert excinfo.value.name == module
     for phrase in _INSTALL_PHRASES:
         assert phrase in str(excinfo.value)
 
@@ -293,6 +415,58 @@ def test_amg_kwargs_pass_through_to_the_generator(fake_ml: _FakeAmgFactory) -> N
     assert kwargs["crop_n_layers"] == 0
     assert kwargs["points_per_side"] is None
     assert np.asarray(kwargs["point_grids"][0]).shape == (64, 2)
+
+
+def test_unknown_kwarg_is_rejected_before_the_weights_load(
+    fake_ml: _FakeAmgFactory,
+) -> None:
+    """★ kwargs 名の誤記はモデルロード**前**に落ちる(近い名前の提示つき)。
+
+    どう壊れたら落ちるか: 名前の検疫を外すと未知名は `**segmenter_kwargs` に
+    抱えられたまま運ばれ、`TypeError` が出るのは親 `__init__` へ展開する瞬間
+    = **重みロードの後**になる。実測では `merge_threhold` の 1 文字違いで、
+    数百 MB の取得と GPU ロードを終えてから初めて失敗した。
+
+    `fake_ml.calls` が空であることが「ロード前に落ちた」証拠(この fixture は
+    `from_pretrained` の呼び出しを記録する)。
+    """
+    with pytest.raises(ValueError) as excinfo:
+        make_sam2_segmenter(merge_threhold=0.5)
+
+    message = str(excinfo.value)
+    assert "merge_threhold" in message
+    assert "did you mean 'merge_threshold'?" in message
+    assert fake_ml.calls == [], "the model must not be loaded before the name check"
+
+
+def test_unknown_kwarg_message_lists_the_accepted_names(
+    fake_ml: _FakeAmgFactory,
+) -> None:
+    """候補が思いつかない誤記でも、受け付ける名前の一覧で行動可能にする。
+
+    一覧には `build_sam2_segmenter` 自身の引数(`model_id` 等)も含める —
+    それらの誤記も `**segmenter_kwargs` に落ちてここへ来るため。
+    """
+    with pytest.raises(ValueError) as excinfo:
+        make_sam2_segmenter(zzz_not_a_parameter=1)
+
+    message = str(excinfo.value)
+    assert "zzz_not_a_parameter" in message
+    assert "n_views" in message and "model_id" in message  # 親と build の両方
+    assert fake_ml.calls == []
+
+
+def test_known_kwargs_still_pass_through_to_the_parent(
+    fake_ml: _FakeAmgFactory,
+) -> None:
+    """負の対照: 正しい名前は素通りして親へ届く(検疫が広すぎたら落ちる)。"""
+    segmenter = make_sam2_segmenter(merge_threshold=0.75, n_views=32, min_votes=3)
+    try:
+        assert segmenter.merge_threshold == 0.75
+        assert segmenter.n_views == 32
+        assert segmenter.min_votes == 3
+    finally:
+        segmenter.close()
 
 
 def test_bad_fusion_kwargs_still_close_the_proposer(
@@ -664,6 +838,82 @@ def test_proposer_detects_an_ineffective_grid_swap() -> None:
     proposer = sam2_masks.Sam2MaskProposer(generator, channels=("shading",))
     with pytest.raises(RuntimeError, match="point_grids"):
         proposer.propose(view)
+
+
+class _QueuedGenerator:
+    """呼び出しごとに**別の**レコード列を返す generator スタブ。
+
+    `_FakeGenerator` は毎回同じ列を返すので、「1 回目は候補ゼロ、2 回目は候補
+    あり」という**既定 2 チャンネル構成(`("sdf", "shading")`)で現実に起こる
+    遷移**を再現できない。シード整合検査の保留規約はまさにその遷移でしか
+    観測できないため、順番に応答を変えられるスタブを別に置く。
+    """
+
+    def __init__(self, queued: list[list[dict[str, Any]]]) -> None:
+        self.point_grids: list[np.ndarray] | None = None
+        self.queued = [list(records) for records in queued]
+        self.calls = 0
+
+    def generate(self, image: np.ndarray) -> list[dict[str, Any]]:
+        records = self.queued[self.calls] if self.calls < len(self.queued) else []
+        self.calls += 1
+        return list(records)
+
+
+def _sdf_shading_proposer(generator: Any) -> Any:
+    """既定 2 チャンネル構成の proposer(厚みを入れて `"sdf"` を通せる状態にする)。"""
+    proposer = sam2_masks.Sam2MaskProposer(generator)  # channels=("sdf", "shading")
+    proposer.set_face_thickness(np.array([0.25]))
+    return proposer
+
+
+def test_seed_check_is_deferred_until_candidates_actually_arrive() -> None:
+    """★ 候補ゼロの結果で「検査済み」にしない(空→非空の遷移で検査が効く)。
+
+    どう壊れたら落ちるか: `_seed_checked` を `records` の中身に関わらず立てる実装
+    (= 修正前)に戻した瞬間に落ちる。そのとき 1 回目(sdf チャンネル)の空応答が
+    検査を消費してしまい、2 回目(shading)のシルエット外シードが**素通り**する
+    — 実測では `RuntimeError` の代わりにマスク `(1, H, W)` が返り、以降の全視点で
+    検査が二度と走らない状態になった。
+
+    既存の 2 件(`test_proposer_detects_an_ineffective_grid_swap` = 最初から候補
+    あり、`test_proposer_returns_no_masks_for_an_empty_silhouette` = 常に候補ゼロ)
+    はどちらもこの**遷移**を通らないので、この穴を捕まえられない。
+    """
+    view, _ = _foreground_view()
+    outside = np.zeros((16, 16), dtype=bool)
+    outside[4:8, 4:12] = True  # 32px / 64 = 面積帯の内側 = 検査が無ければ通過する
+    generator = _QueuedGenerator([[], [_record(outside, (0.0, 0.0))]])
+    proposer = _sdf_shading_proposer(generator)
+
+    with pytest.raises(RuntimeError, match="point_grids"):
+        proposer.propose(view)
+    assert generator.calls == 2, "both channels must have reached the generator"
+
+
+def test_seed_check_still_runs_only_once_after_the_first_candidates() -> None:
+    """負の対照: 一度**実際に**検査したら再検査しない(毎回検査に変えたら落ちる)。
+
+    検査は「差し替えが効いているか」の一度きりの実測であって、視点ごとの
+    フィルタではない。保留規約を入れたついでに「常に検査する」へ広げると、
+    正常な SAM2 でも候補のシードが偶然シルエット外へ寄った視点で誤爆する。
+    """
+    view, _ = _foreground_view()
+    inside = np.zeros((16, 16), dtype=bool)
+    inside[4:8, 4:12] = True
+    generator = _QueuedGenerator(
+        [
+            [],  # 視点1 sdf: 候補ゼロ → 検査は保留のまま
+            [_record(inside, (6.0, 6.0))],  # 視点1 shading: シルエット内シード = 合格
+            [_record(inside, (0.0, 0.0))],  # 視点2 sdf: 背景シード。もう検査しない
+        ]
+    )
+    proposer = _sdf_shading_proposer(generator)
+
+    assert proposer.propose(view).shape == (1, 16, 16)
+    assert generator.calls == 2
+    assert proposer.propose(view).shape == (1, 16, 16)  # 例外が出ないこと自体が assert
+    assert generator.calls == 4
 
 
 def test_set_face_thickness_validates_its_input() -> None:

@@ -16,12 +16,13 @@ CI の `-m "not ml and not gl"` でも全件走る)。合成 `RenderedView` と�
 
 from __future__ import annotations
 
+import inspect
 import warnings
 
 import numpy as np
 import pytest
 
-from atlasmith.segmentation import DihedralSegmenter, SegmentationBackend
+from atlasmith.segmentation import DihedralSegmenter, SegmentationBackend, multiview
 from atlasmith.segmentation.adjacency import (
     build_face_adjacency,
     smooth_edge_mask,
@@ -1240,6 +1241,113 @@ def test_segment_without_entering_the_context_manager_is_allowed(
             pass
     segmenter.close()  # 冪等
     assert proposer.close_count == 1
+
+
+def test_public_symbols_are_the_six_approved_names() -> None:
+    """★ 公開契約(`__all__`)は 6 件に固定する(2026-08-07 外部レビュー裁定)。
+
+    どう壊れたら落ちるか: 新しい定数やヘルパを `__all__` へ足した瞬間。公開
+    シンボルは一度出すと引っ込められないので、数を機械で固定して「気づかない
+    うちに増えていた」を防ぐ。
+
+    `DEFAULT_*` は **module 属性としては残る**ので、外したのは star-import の
+    公開契約からだけである(`sam2_masks` と ML テストは実際にこれらを
+    `from ... import` している)。その区別もここで一緒に固定する。
+    """
+    assert multiview.__all__ == [
+        "Camera",
+        "MaskProposer",
+        "MeshRenderer",
+        "MultiViewSegmenter",
+        "RenderedView",
+        "make_sam2_segmenter",
+    ]
+    # `Camera` を残す理由(`MeshRenderer.render_view` の引数型)が実在すること。
+    assert "camera" in inspect.signature(multiview.MeshRenderer.render_view).parameters
+    # `__all__` 非掲載でも属性としては引き続き参照できる。
+    for name in ("DEFAULT_IMAGE_SIZE", "DEFAULT_PROJECTION", "DEFAULT_SHADING"):
+        assert hasattr(multiview, name)
+        assert name not in multiview.__all__
+
+
+def test_close_failure_leaves_the_proposer_retryable() -> None:
+    """★ `close()` は proposer を**解放してから**閉鎖済みにする。
+
+    どう壊れたら落ちるか: フラグを先に立てる実装(= 修正前)に戻した瞬間。
+    そのとき 1 回目の `close()` が失敗すると 2 回目は冪等ガードで即 return し、
+    **`proposer.close()` は二度と呼ばれない** — 重み(GPU メモリ)が解放前・
+    部分解放の状態で永久に残る。実測は `close 1 RuntimeError / close 2 ok /
+    calls 1 / closed_flag True`(= 解放されていないのに「閉じた」)。
+
+    `MaskProposer.close()` の契約は冪等なので、失敗後の再呼び出しは安全である。
+    """
+
+    class _FlakyProposer:
+        """1 回目だけ失敗する proposer(部分解放の途中で落ちる実装の代役)。"""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def propose(self, view: object) -> np.ndarray:  # pragma: no cover - 未使用
+            raise AssertionError("propose is not part of this contract test")
+
+        def close(self) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("release failed halfway")
+
+    proposer = _FlakyProposer()
+    segmenter = MultiViewSegmenter(proposer, lambda _mesh: None)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="release failed halfway"):
+        segmenter.close()
+    assert proposer.calls == 1
+
+    # 再試行が**実際に proposer へ届く**こと(ここが本丸)。
+    segmenter.close()
+    assert proposer.calls == 2
+
+    # 成功後は通常どおり閉鎖済み: 冪等で、`segment()` は RuntimeError。
+    segmenter.close()
+    assert proposer.calls == 2
+    with pytest.raises(RuntimeError, match="has been closed"):
+        segmenter.segment(
+            MeshData(
+                vertices=np.zeros((1, 3), dtype=np.float64),
+                faces=np.zeros((0, 3), dtype=np.int64),
+                source_vertex=np.zeros(1, dtype=np.int64),
+            )
+        )
+
+
+def test_exit_propagates_a_close_failure_without_marking_it_closed() -> None:
+    """`__exit__` 経由でも同じ — 例外は伝播し、リソースは再解放できる。
+
+    `with` を使う経路(CLI の `_segmentation_backend` はこちら)でも解放漏れが
+    起きないことを、`close()` 直呼びとは別に固定する。
+    """
+
+    class _AlwaysFailingProposer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def propose(self, view: object) -> np.ndarray:  # pragma: no cover - 未使用
+            raise AssertionError("propose is not part of this contract test")
+
+        def close(self) -> None:
+            self.calls += 1
+            raise RuntimeError("release failed")
+
+    proposer = _AlwaysFailingProposer()
+    segmenter = MultiViewSegmenter(proposer, lambda _mesh: None)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="release failed"):
+        with segmenter:
+            pass
+    assert proposer.calls == 1
+    # 「閉じたことにされていない」= もう一度解放を試みられる。
+    with pytest.raises(RuntimeError, match="release failed"):
+        segmenter.close()
+    assert proposer.calls == 2
 
 
 def test_renderer_is_closed_even_when_the_proposer_raises(

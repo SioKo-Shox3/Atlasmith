@@ -38,10 +38,21 @@ from atlasmith.segmentation.multiview.cameras import (
 from atlasmith.segmentation.multiview.faceid import validate_face_count
 from atlasmith.types import MeshData
 
+# 公開契約は 6 件(2026-08-07 外部レビュー裁定)。数を固定しているのは
+# `tests/test_multiview_sam2.py::test_public_symbols_are_the_six_approved_names`。
+#
+# **`Camera` を残す WHY**(将来また「承認外の公開シンボル」として指摘されない
+# ように理由をここに置く): `MeshRenderer.render_view(camera: Camera)` の**引数型**
+# であり、`MeshRenderer` は外部が実装しうる Protocol である。`Camera` を隠すと
+# 注入用レンダラを書く側が引数の型を名指しできず、Protocol の公開が意味を失う。
+#
+# **`DEFAULT_IMAGE_SIZE` / `DEFAULT_PROJECTION` / `DEFAULT_SHADING` を外す WHY**:
+# `__all__` から外すのは star-import の公開契約から外すことだけで、module 属性
+# としては残るので `from atlasmith.segmentation.multiview import DEFAULT_IMAGE_SIZE`
+# は従来どおり通る(`sam2_masks` と ML テストが実際にそう import している)。
+# 既定値は「注入する側が参照する内部の出発点」であって、外部へ約束する型・
+# 入口ではない。
 __all__ = [
-    "DEFAULT_IMAGE_SIZE",
-    "DEFAULT_PROJECTION",
-    "DEFAULT_SHADING",
     "Camera",
     "MaskProposer",
     "MeshRenderer",
@@ -334,14 +345,21 @@ class MultiViewSegmenter:
     def close(self) -> None:
         """所有する `proposer` を解放する。**冪等**(2 回目以降は無操作)。
 
-        `proposer.close()` が例外を投げても「閉じた」状態は維持する(閉じ済みの
-        フラグを先に立てる) — 再試行して二重解放を起こすより、1 回で確定させて
-        例外を呼び出し側へ伝える方が安全。
+        **解放が成功してからフラグを立てる**(2026-08-07 外部レビュー指摘で
+        順序を反転): 逆順(フラグ先行)だと、`proposer.close()` が**解放前**や
+        **部分解放**の時点で例外を投げたとき、リソース(SAM2 の重み = GPU メモリ
+        数 GB)が残ったまま segmenter が「閉じた」ことになり、**二度と解放
+        できなくなる**。`MaskProposer.close()` は冪等が契約(この module の
+        Protocol 定義)なので、失敗後の再呼び出しは安全であり、再試行できる
+        状態を保つ方が確実に安全側に倒れる。
+
+        例外は握り潰さず呼び出し側へ伝える(`__exit__` 経由でも同じ)。その場合
+        `_closed` は False のままなので、呼び出し側は `close()` を再実行できる。
         """
         if self._closed:
             return
-        self._closed = True
         self._proposer.close()
+        self._closed = True
 
     def segment(self, mesh: MeshData) -> np.ndarray:
         """面ごとの部位ラベルを返す(視点をストリーミングして融合する)。
@@ -476,10 +494,16 @@ def make_sam2_segmenter(**kwargs: Any) -> MultiViewSegmenter:
     ときも `segment()` が `UserWarning` を出す。
 
     Raises:
-        ImportError: torch / sam2 が未導入のとき。メッセージが
+        ModuleNotFoundError: torch / sam2 が**未導入**のとき。メッセージが
             `uv sync --extra ml` / `pip install "atlasmith[ml]"` /
-            `--segmenter geometric` の 3 経路を提示する。
-        ValueError: パラメータが契約外のとき(`crop_n_layers != 0` を含む)。
+            `--segmenter geometric` の 3 経路を提示する。**不在だけがこの型**で
+            あり、CLI の既定フォールバックはこれだけを条件にする。
+        ImportError: torch / sam2 は導入済みだが import が失敗したとき(ABI 不整合・
+            推移的依存の欠落 = 壊れたインストール)。別アルゴリズムでの代替は
+            行わず伝播する(`sam2_masks._is_absent` の WHY)。
+        ValueError: パラメータが契約外のとき(`crop_n_layers != 0` を含む)、または
+            **未知のキーワード名**が渡されたとき。名前の検疫は重みロードより前に
+            走る(`sam2_masks._validate_segmenter_kwargs`)。
 
     **WHY 本体が `sam2_masks.py` で、ここは委譲だけか**: `sam2_masks` は隔離
     モジュール2(計画v4 §2.1)。module 直下で import すると

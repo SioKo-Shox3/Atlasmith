@@ -28,6 +28,8 @@ import だけ**。module 直下に書くと `tests/test_import_isolation.py` の
 
 from __future__ import annotations
 
+import difflib
+import inspect
 import logging
 import time
 import warnings
@@ -98,6 +100,44 @@ _COLLAPSE_EVIDENCE = (
 ) % (DEFAULT_N_VIEWS, DEFAULT_IMAGE_SIZE)
 
 
+def _is_absent(error: ImportError, module: str) -> bool:
+    """`error` が「`module` **本体**がそもそも存在しない」ことを示すか。
+
+    **不在と破損を分ける唯一の述語**(2026-08-07 外部レビュー指摘)。CLI の既定
+    経路は「`[ml]` extra 未導入」のときだけ幾何バックエンドへ落ちてよく、
+    **壊れたインストールを黙って別アルゴリズムで代替してはならない**(exit 0 の
+    まま別物の成果物が出て、原因も誤って報告される)。
+
+    判定は 2 条件の連言:
+
+      - `ModuleNotFoundError` であること — ABI 不整合や DLL ロード失敗、
+        `cannot import name ...` は素の `ImportError` なのでここで落ちる。
+      - 欠落モジュール名が `module` に**完全一致**すること — 推移的依存の欠落
+        (`No module named 'hydra'`)や部分的に壊れた配布物
+        (`No module named 'sam2.automatic_mask_generator'` = パッケージは在るが
+        中身が無い)は不在ではなく破損なので、`.split(".")[0]` のような緩い
+        判定はしない。
+    """
+    return isinstance(error, ModuleNotFoundError) and error.name == module
+
+
+def _broken_install_error(module: str, error: ImportError) -> ImportError:
+    """「導入済みだが import に失敗した」ときのエラーを組む(不在とは別物)。
+
+    素の `ImportError`(= `ModuleNotFoundError` **ではない**)を返すので、CLI の
+    既定フォールバックは `_is_absent` の判定でこれを掴まず、そのまま伝播する。
+    """
+    return ImportError(
+        f"{module} is installed but importing it failed: {error}. This is a "
+        f"broken {module} installation (ABI/CUDA mismatch, or a missing "
+        "transitive dependency), not a missing optional extra, so Atlasmith "
+        "will not silently continue with a different segmentation algorithm. "
+        f"Repair the environment (`uv sync --reinstall --extra ml` reinstalls "
+        "the ML stack), or pass `--segmenter geometric` to run with no ML "
+        "dependency at all."
+    )
+
+
 def _import_torch() -> Any:
     """torch を**関数内で** import する(計画v4 §2.1 規約2)。
 
@@ -106,16 +146,23 @@ def _import_torch() -> Any:
         module 直下 import が要り隔離規約に反するため(`render.py` と同じ判断)。
 
     Raises:
-        ImportError: torch が未導入のとき。導入手順と代替経路を提示する。
+        ModuleNotFoundError: torch が**未導入**のとき(`name="torch"`)。導入手順と
+            代替経路を提示する。CLI の既定経路はこれだけをフォールバック条件に
+            する(`_is_absent`)。
+        ImportError: torch は導入済みだが import に失敗したとき(破損)。**別の
+            メッセージ**で不在と区別でき、フォールバックの対象にはならない。
     """
     try:
         import torch
     except ImportError as e:
-        raise ImportError(
+        if not _is_absent(e, "torch"):
+            raise _broken_install_error("torch", e) from e
+        raise ModuleNotFoundError(
             "torch is required by the SAM2 multi-view segmenter but is not "
             "installed. Install the optional extra with `uv sync --extra ml` "
             '(or `pip install "atlasmith[ml]"`), then install a CUDA build of '
-            "torch, or use `--segmenter geometric`, which needs no GPU at all."
+            "torch, or use `--segmenter geometric`, which needs no GPU at all.",
+            name="torch",
         ) from e
     return torch
 
@@ -128,16 +175,22 @@ def _import_sam2() -> Any:
         呼び出し側が使うのはこれだけで、`from_pretrained` も classmethod)。
 
     Raises:
-        ImportError: sam2 が未導入のとき。導入手順と代替経路を提示する。
+        ModuleNotFoundError: sam2 が**未導入**のとき(`name="sam2"`)。導入手順と
+            代替経路を提示する。
+        ImportError: sam2 は導入済みだが import に失敗したとき(破損)。詳細は
+            `_import_torch` と同じ — `_is_absent` の docstring 参照。
     """
     try:
         from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
     except ImportError as e:
-        raise ImportError(
+        if not _is_absent(e, "sam2"):
+            raise _broken_install_error("sam2", e) from e
+        raise ModuleNotFoundError(
             "sam2 is required by the SAM2 multi-view segmenter but is not "
             "installed. Install the optional extra with `uv sync --extra ml` "
             '(or `pip install "atlasmith[ml]"`), or use `--segmenter geometric`, '
-            "which needs no ML dependencies at all."
+            "which needs no ML dependencies at all.",
+            name="sam2",
         ) from e
     return SAM2AutomaticMaskGenerator
 
@@ -243,6 +296,56 @@ def _warn_if_below_validated_defaults(n_views: Any, image_size: Any) -> None:
     )
 
 
+def _keyword_names(func: Any) -> frozenset[str]:
+    """`func` のキーワード専用引数名を signature から読む(名前表を手書きしない)。
+
+    `**kwargs`(VAR_KEYWORD)は「何でも受ける」印なので名前として数えない —
+    それを数えると検疫が常に空振りする。
+    """
+    return frozenset(
+        name
+        for name, parameter in inspect.signature(func).parameters.items()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    )
+
+
+def _validate_segmenter_kwargs(segmenter_kwargs: dict[str, Any]) -> None:
+    """親へ透過する `**segmenter_kwargs` の**名前**を検証する(裁定: ロード前)。
+
+    **WHY(2026-08-07 外部レビュー指摘)**: `make_sam2_segmenter` →
+    `build_sam2_segmenter` → `MultiViewSegmenter.__init__` の経路は未知名を
+    `**kwargs` に抱えたまま運び、`TypeError` が出るのは親へ展開する瞬間 =
+    **重みロードの後**である。実測では `merge_threhold`(`merge_threshold` の
+    誤記)1 文字で、数百 MB の取得と GPU ロードを終えてから失敗した。名前の
+    照合は依存ゼロ・ミリ秒なので、**安価な検証を先に全部済ませる**(この
+    ファイルの fail-fast 方針)に揃える。
+
+    候補名の提示に `build_sam2_segmenter` 自身の引数も混ぜるのは、`model_di` の
+    ような誤記が(`**segmenter_kwargs` に落ちる以上)ここでしか捕まらないため。
+
+    Raises:
+        ValueError: 未知のキーワード名が含まれるとき。近い名前があれば提示する。
+    """
+    accepted = _keyword_names(MultiViewSegmenter.__init__)
+    unknown = sorted(name for name in segmenter_kwargs if name not in accepted)
+    if not unknown:
+        return
+    # 誤記の候補プールは「この呼び出しで書けたはずの名前」全体。
+    pool = sorted(accepted | _keyword_names(build_sam2_segmenter))
+    reported = []
+    for name in unknown:
+        close = difflib.get_close_matches(name, pool, n=1)
+        suggestion = f" (did you mean {close[0]!r}?)" if close else ""
+        reported.append(f"{name!r}{suggestion}")
+    raise ValueError(
+        "unknown keyword argument(s) for the SAM2 segmenter: "
+        + ", ".join(reported)
+        + ". Accepted names are: "
+        + ", ".join(pool)
+        + "."
+    )
+
+
 def _validate_crop_n_layers(crop_n_layers: int) -> int:
     """`crop_n_layers` を検証して返す — **受理するのは 0 だけ**。
 
@@ -325,6 +428,11 @@ def _check_seed_alignment(records: list[dict], coverage: np.ndarray) -> None:
     いない(sam2 の版が generate 時に `point_grids` 属性を読まなくなった)と
     みなして止める — 黙って一様グリッド相当の品質へ落ちるより、壊れたことを
     知らせて止まる方が安全(probe 実証済みの検査)。
+
+    **空の `records` は「検査できなかった」であって「合格」ではない。** 呼び出し
+    側(`Sam2MaskProposer.propose`)は候補が得られるまで検査を保留するので、
+    通常ここへ空は届かない。下の早期 return は手書き呼び出し向けの防御であり、
+    「検査済み」を意味しない(その判定は呼び出し側にある)。
     """
     if not records:
         return
@@ -480,7 +588,15 @@ class Sam2MaskProposer:
                 len(records),
                 time.perf_counter() - started,
             )
-            if not self._seed_checked:
+            # **候補ゼロの結果で「検査済み」にしない**(2026-08-07 外部レビュー
+            # 指摘): 検査は返却シードの所在を見るので、`records` が空だと**何も
+            # 見ていない**。それで `_seed_checked` を立てると、以降の全視点・全
+            # チャンネルで検査が二度と走らなくなる。既定構成 `("sdf", "shading")`
+            # では「1 回目(sdf)は候補ゼロ、2 回目(shading)は候補あり」が現実に
+            # 起こりうるので、この取りこぼしは仮定ではなく実在の穴だった。
+            # 検査は「`point_grids` 差し替えが効いているか」の唯一の警報装置
+            # なので、**実際に候補が得られるまで保留する**。
+            if records and not self._seed_checked:
                 _check_seed_alignment(records, coverage)
                 self._seed_checked = True
             for record in records:
@@ -685,9 +801,15 @@ def build_sam2_segmenter(
             `image_size` が検証済み既定を下回るとき(2026-08-03 反証レビュー B-3)。
 
     Raises:
-        ImportError: torch / sam2 が未導入のとき(導入手順つきメッセージ)。
-        ValueError: いずれかのパラメータが契約外のとき。
+        ModuleNotFoundError: torch / sam2 が**未導入**のとき(導入手順つき)。
+        ImportError: torch / sam2 は導入済みだが import に失敗したとき(破損 —
+            不在とは別メッセージで、CLI の既定フォールバック対象にならない)。
+        ValueError: いずれかのパラメータが契約外のとき、または
+            `**segmenter_kwargs` に未知のキーワード名が含まれるとき。
     """
+    # --- 0. **名前**の検疫(重みロードより前 — `_validate_segmenter_kwargs` の WHY)。
+    _validate_segmenter_kwargs(segmenter_kwargs)
+
     # --- 1. 安価な検証を最初に全部済ませる(fail-fast)。数百 MB の重みロードの
     # 後に typo の ValueError を出さない。image_size / shading の値の番人は
     # `_ModernglRenderer.__init__` だが、それが走るのは最初の `segment()`

@@ -41,6 +41,62 @@ _SEG_PARAM_FLAGS = (
 # `--segmenter geometric` を**明示**したときに併用できない sam2 専用フラグ。
 _SAM2_ONLY_FLAGS = (("seg_views", "--seg-views"), ("seg_model", "--seg-model"))
 
+# 既定フォールバックを許す「依存の完全不在」を表すモジュール名(2026-08-07
+# 外部レビュー裁定)。ここに載るのは ML スタックの**本体**だけで、推移的依存は
+# 含めない — 詳細は `_is_missing_ml_extra`。
+_ML_ROOT_MODULES = frozenset({"torch", "sam2"})
+
+
+def _positive_int(text: str) -> int:
+    """`argparse` 用: 正の整数だけを受ける(0 と負値を入口で弾く)。
+
+    **WHY CLI にも置くか**(2026-08-07 外部レビュー指摘): 同じ検疫は
+    `rebake` にもあるが、そこで落ちると Python の traceback が出る。CLI 利用者
+    への正しい応答は exit 2 + usage + フラグ名つき 1 行であり、それを出せるのは
+    `argparse` だけ。`rebake` 側は API 直呼びの防壁で、二重ではなく別の入口。
+    """
+    return _bounded_int(text, minimum=1)
+
+
+def _non_negative_int(text: str) -> int:
+    """`argparse` 用: 0 以上の整数だけを受ける(`--padding 0` は合法)。
+
+    `padding_px=0`(ガター無し)は利用者が意図的に選べる状態なので許す —
+    禁止するのは負値だけ(`rebake` の `padding_px > 0` 判定と同じ境界)。
+    """
+    return _bounded_int(text, minimum=0)
+
+
+def _bounded_int(text: str, *, minimum: int) -> int:
+    """`text` を整数として解釈し、`minimum` 以上であることを確かめる。"""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {text!r}") from None
+    if value < minimum:
+        raise argparse.ArgumentTypeError(f"must be >= {minimum}, got {value}")
+    return value
+
+
+def _is_missing_ml_extra(error: ImportError) -> bool:
+    """既定経路のフォールバックを許してよい失敗か(= `[ml]` extra が丸ごと不在)。
+
+    **WHY こんなに狭いか(2026-08-07 外部レビュー裁定)**: 以前は
+    `make_sam2_segmenter()` 全体を広い `except ImportError` で囲っていたため、
+    **壊れた sam2 インストール**(ABI 不整合・推移的依存の欠落)まで幾何経路へ
+    落ちていた。実測では `ImportError("installed sam2 ABI mismatch: missing
+    internal symbol")` で **exit 0 のまま別アルゴリズムの成果物**が出て、警告は
+    「[ml] extra is not installed」と原因を誤って報告した。設計が許したのは
+    「ML extra 未導入時のフォールバック」だけであり、壊れたインストールの
+    黙殺は含まない。
+
+    判定は `sam2_masks._is_absent` が組み立てた型と名前をそのまま読む:
+    不在は `ModuleNotFoundError(name="torch" | "sam2")`、破損は素の
+    `ImportError`。ここで `.name` まで見るのは、ML 本体は在るのに推移的依存
+    (`hydra` 等)が欠けた環境を「未導入」と誤診しないため。
+    """
+    return isinstance(error, ModuleNotFoundError) and error.name in _ML_ROOT_MODULES
+
 
 def _build_parser() -> argparse.ArgumentParser:
     """CLI の引数パーサを組み立てる。"""
@@ -54,15 +110,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--padding",
-        type=int,
+        type=_non_negative_int,
         default=8,
-        help="Chart padding / gutter dilation in texels (default: 8)",
+        help="Chart padding / gutter dilation in texels, >= 0 (default: 8)",
     )
     parser.add_argument(
         "--texture-size",
-        type=int,
+        type=_positive_int,
         default=1024,
-        help="Output texture edge length in texels (default: 1024)",
+        help="Output texture edge length in texels, >= 1 (default: 1024)",
     )
     parser.add_argument(
         "--granularity",
@@ -177,10 +233,13 @@ def _segmentation_backend(
       - `--segmenter sam2` を**明示**した → `ImportError` をそのまま伝播させる
         (3 経路を提示する `sam2_masks` のメッセージが CLI の非ゼロ終了とともに
         出る)。「黙ってフォールバックしない」原則は明示指定経路で保たれる。
-      - **既定経由**(`--segmenter` 未指定)→ `warnings.warn` して `geometric` へ
-        フォールバックする。CI(`uv sync --locked` = extras 無し)と既定 CLI パスを
-        踏む既存テストを green に保つための裁定であり、警告を出すので「黙って」
-        ではない。
+      - **既定経由**(`--segmenter` 未指定)+ **依存の完全不在** → `warnings.warn`
+        して `geometric` へフォールバックする。CI(`uv sync --locked` = extras
+        無し)と既定 CLI パスを踏む既存テストを green に保つための裁定であり、
+        警告を出すので「黙って」ではない。
+      - **既定経由でも「壊れたインストール」は伝播させる**(2026-08-07 外部
+        レビュー裁定): ABI 不整合・推移的依存の欠落は「ML extra 未導入」では
+        ないので、フォールバックの対象外。判定は `_is_missing_ml_extra`。
 
     Args:
         args: 解析済み引数(衝突判定通過後)。
@@ -222,7 +281,11 @@ def _segmentation_backend(
         try:
             segmenter = make_sam2_segmenter(**sam2_kwargs)
         except ImportError as error:
-            if explicit:
+            # **フォールバックは「依存の完全不在」に限る**(2026-08-07 裁定 —
+            # `_is_missing_ml_extra` の WHY)。明示指定はもとより伝播させるが、
+            # 既定経路でも壊れたインストールは伝播させる: 黙って別アルゴリズムの
+            # 成果物を exit 0 で出す方が、落ちるより有害である。
+            if explicit or not _is_missing_ml_extra(error):
                 raise
             warnings.warn(
                 "--segmenter sam2 is the default but the [ml] extra is not "

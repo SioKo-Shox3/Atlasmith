@@ -23,6 +23,8 @@ from importlib.metadata import version
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
+
 from atlasmith.bake import bake_maps
 from atlasmith.io import load_mesh, save_mesh
 from atlasmith.metrics import masked_psnr
@@ -49,6 +51,50 @@ _LOGGER = logging.getLogger(__name__)
 
 # `granularity` が取りうる値。未知の値は黙って既定へ倒さず `ValueError`(裁定B)。
 GRANULARITIES = ("part", "naive")
+
+
+def _validate_size_argument(
+    value: object, name: str, flag: str, *, minimum: int
+) -> int:
+    """`rebake` の寸法系引数(テクセル数)を入口で検疫する。
+
+    **WHY 入口か(2026-08-07 外部レビュー指摘)**: これらの値は検証されないまま
+    xatlas の `PackOptions` へ流れていた。実測の被害は 2 種類:
+
+      - `texture_size=0` は**エラーにならない**。1450x726 のアトラスを組む高コスト
+        処理を最後まで走らせてから `(0, 0, 3)` の無効なテクスチャを書き出す。
+      - 負値は xatlas 内部の生 `TypeError` になる。引数名も、直し方も出ない。
+
+    どちらも「呼び出した瞬間に、名前つきで落ちる」べきもの。`bool` を弾くのは
+    `isinstance(True, int)` が真だからで、この規約は本リポジトリの他の検証関数
+    (`multiview` の `n_views` 等)と同じ形に揃えてある。
+
+    Args:
+        value: 検疫対象の値。
+        name: `rebake` の引数名(メッセージに出す)。
+        flag: 対応する CLI フラグ名(利用者の入口はほぼこちら)。
+        minimum: 許す最小値。
+
+    Returns:
+        `int` へ正規化した値(`np.integer` も受ける)。
+
+    Raises:
+        ValueError: 整数でない、または `minimum` 未満のとき。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(
+            f"rebake: {name} must be an int (texels), got "
+            f"{type(value).__name__} {value!r}"
+        )
+    number = int(value)
+    if number < minimum:
+        raise ValueError(
+            f"rebake: {name} must be >= {minimum}, got {number}. It is measured in "
+            f"texels and is passed straight to the xatlas packer, which rejects "
+            f"or silently mis-packs out-of-range values. Pass a valid size "
+            f"(CLI: {flag})."
+        )
+    return number
 
 
 def _gutter_iterations(padding_px: int, texture_size: int, atlas_edge: int) -> int:
@@ -100,9 +146,10 @@ def rebake(
     引数:
         input_path: 入力メッシュ(.glb/.gltf/.obj)。
         output_path: 出力メッシュ(拡張子で形式が決まる)。
-        texture_size: 焼き先テクスチャの一辺(テクセル)。xatlas のパッキング解像度と
-            bake の出力サイズの双方に使う。
-        padding_px: チャート間パディング兼ガター膨張回数(テクセル)。xatlas へは
+        texture_size: 焼き先テクスチャの一辺(テクセル)。**1 以上の int**。xatlas の
+            パッキング解像度と bake の出力サイズの双方に使う。
+        padding_px: チャート間パディング兼ガター膨張回数(テクセル)。**0 以上の
+            int**(0 = ガター無しを意図的に選ぶ状態)。xatlas へは
             この値をそのまま渡す。**部位経路では** bake のガター反復数だけが
             アトラス実寸法に応じて `_gutter_iterations` で縮む(計画v2 §2.3a 手順3)。
             naive 経路は Phase 1 と bit 一致を保つため素の値のまま使う。
@@ -114,7 +161,9 @@ def rebake(
             のを防ぐ)。
 
     Raises:
-        ValueError: `granularity` が未知、`granularity="naive"` に `segmentation`
+        ValueError: `texture_size` / `padding_px` が整数でないか範囲外
+            (`texture_size >= 1` / `padding_px >= 0` — `_validate_size_argument`)、
+            `granularity` が未知、`granularity="naive"` に `segmentation`
             を指定した、maps があるのに UV が無い、または pack 層の検疫・不変条件に
             反したとき。
 
@@ -157,6 +206,13 @@ def rebake(
         テクスチャを持たないメッシュ(maps が空)はジオメトリと新 UV のみを書き出す。
         maps があるのに UV が無い入力は焼き元 UV を欠くため ValueError にする。
     """
+    # 検疫は**読み込みより前**に済ませる(無効な設定で数十秒の処理を始めない)。
+    texture_size = _validate_size_argument(
+        texture_size, "texture_size", "--texture-size", minimum=1
+    )
+    padding_px = _validate_size_argument(
+        padding_px, "padding_px", "--padding", minimum=0
+    )
     if granularity not in GRANULARITIES:
         raise ValueError(
             f"rebake: unknown granularity {granularity!r}, expected one of "

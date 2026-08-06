@@ -7,7 +7,9 @@ aperiodic/face_id)を提供する。Phase 1(bake)のテストからも共用す�
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Sequence
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -775,6 +777,70 @@ _CAPABILITY_SKIP_REASONS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# ML テストのオフライン再現性(2026-08-06)
+#
+# `SAM2AutomaticMaskGenerator.from_pretrained` は **構築 1 回につき HuggingFace へ
+# 1 往復**する(重みがキャッシュ済みでも ETag の HEAD が飛ぶ)。全量 1 回で 6 往復
+# (`tests/test_multiview_sam2.py` x4 + CLI subprocess x2)あり、ML テストの成否が
+# 外部サービスの可用性に結びついていた。ここで**キャッシュ済みのときだけ** HF を
+# offline へ固定し、ML テストからネットワーク依存そのものを取り除く。
+#
+# **production は一切変更しない**(初回 DL は従来どおり動く)。これは pytest 内で
+# しか効かない設定であり、キャッシュが無ければ何もしない = 未取得の機械では
+# 従来どおり DL が走る。
+#
+# **なぜ `local_files_only` を渡さないのか(実測 2026-08-06)**: sam2 の
+# `build_sam2_hf` → `_hf_download` は
+# `hf_hub_download(repo_id=model_id, filename=checkpoint_name)` と決め打ちで、
+# 呼び出し側の kwargs を hub へ**転送しない**。しかも
+# `SAM2AutomaticMaskGenerator.__init__` は `**kwargs` を受けるため、
+# `from_pretrained(..., local_files_only=True)` は**エラーにもならず黙って無視
+# される**(実測: `_hf_download` のソースに `**kwargs` 無し / AMG.__init__ は
+# VAR_KEYWORD あり)。「効いているつもりで効いていない」最悪の形なので使わない。
+#
+# **なぜ環境変数と属性の両方を書くのか**: `huggingface_hub.constants` は import 時に
+# 環境変数を 1 度だけ読む。本プロセスでは既に import 済みでありうるので属性を直接
+# 立て(実測: `utils/_http.py` の request hook が `constants.is_offline_mode()` を
+# **リクエストのたびに**参照するので実行中の変更が効く)、環境変数は CLI を叩く
+# subprocess 側へ設定を伝えるために立てる。
+# ---------------------------------------------------------------------------
+
+# huggingface_hub が offline 判定に使う環境変数(subprocess へ伝えるためのもの)。
+_HF_OFFLINE_ENV = "HF_HUB_OFFLINE"
+
+
+def _pin_hf_hub_offline_when_cached() -> bool:
+    """SAM2 の既定重みがキャッシュ済みなら HF アクセスを offline へ固定する。
+
+    Returns:
+        固定したら True、キャッシュが無い/判定できない場合は False(何もしない)。
+
+    判定に失敗する要因(huggingface_hub / sam2 が無い、キャッシュ配置が想定外、
+    sam2 の modelID→ファイル名表が変わった等)はすべて「固定しない」へ倒す —
+    テストの前提を勝手に壊さないため。固定できなかった場合は従来どおり
+    ネットワークへ出る。
+    """
+    try:
+        import huggingface_hub.constants as hf_constants
+        from huggingface_hub import try_to_load_from_cache
+        from sam2.build_sam import HF_MODEL_ID_TO_FILENAMES
+
+        from atlasmith.segmentation.multiview.sam2_masks import DEFAULT_MODEL_ID
+
+        filenames = HF_MODEL_ID_TO_FILENAMES.get(DEFAULT_MODEL_ID)
+        if filenames is None:
+            return False
+        cached = try_to_load_from_cache(repo_id=DEFAULT_MODEL_ID, filename=filenames[1])
+    except Exception:
+        return False
+    if not isinstance(cached, str) or not Path(cached).is_file():
+        return False
+    os.environ[_HF_OFFLINE_ENV] = "1"
+    hf_constants.HF_HUB_OFFLINE = True
+    return True
+
+
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     """`gl` / `ml` マーカー付きの item を、能力が無い環境では skip に落とす。
 
@@ -794,6 +860,38 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 )
                 # gl/ml 両方が付いた item でも skip マーカーは 1 個で足りる。
                 break
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    """ML テストが**実際に走る**実行に限り、HF の offline 固定を試みる。
+
+    **WHY `pytest_collection_modifyitems` ではなくこちらか(実測 2026-08-06)**:
+    `-m` による deselect は `_pytest.mark` の `tryfirst` な
+    `pytest_collection_modifyitems` が行うが、conftest 側の同名フックはそれより
+    **前**に呼ばれる。実測(最小再現 — `-m "not ml"` で ml 1 件 / plain 1 件):
+    `modifyitems: total=2 ml_marked=1` / `collection_finish: total=1 ml_marked=0`。
+    つまり modifyitems 側で判定すると、CI 相当の `-m "not ml and not gl"` 実行でも
+    「ML あり」と誤認する。`pytest_collection_finish` の `session.items` は
+    deselect 後なので、実際に走る集合だけを見られる。
+
+    skip マーカー付き(= 上のフックが能力なしと判定した)item は数えない — GPU の
+    無い機械で固定しても意味が無く、ログに紛らわしい 1 行を足すだけだから。
+
+    固定できたか否かを 1 行 print する: 黙って外部ネットワークに依存し続けている
+    状態と、依存が切れている状態を、実行ログから区別できるようにするため。
+    """
+    will_run_ml = any(
+        item.get_closest_marker("ml") is not None
+        and item.get_closest_marker("skip") is None
+        for item in session.items
+    )
+    if not will_run_ml:
+        return
+    pinned = _pin_hf_hub_offline_when_cached()
+    print(
+        f"\n[hf-offline] {_HF_OFFLINE_ENV}=1 pinned: {pinned} "
+        "(False = weights not cached yet; the ML tests will download them)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1333,3 +1431,158 @@ def _uv_island_labels(faces: np.ndarray) -> np.ndarray:
 def uv_island_labels() -> Callable[[np.ndarray], np.ndarray]:
     """`_uv_island_labels`(新頂点共有 union-find による UV アイランド分解)。"""
     return _uv_island_labels
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Step 2-7: 出力メッシュ → 入力メッシュの独立 face 照合 + 島–ラベル整合検査
+#
+# 既存の fixture / ヘルパ / 定数は 1 行も変更していない(以下はすべて追加)。
+#
+# WHY 「独立 face 照合」か(v2 BL-4 の非循環設計): Step 2-7 の E2E は
+# 「CLI が書いた GLB の各 UV アイランドが単一部位に収まっているか」を検査する。
+# 出力ファイルには部位ラベルも `face_map` も入っていないので、対応を復元する必要が
+# ある。ここで production の `face_map` を借りたり、出力メッシュを再分割して
+# ラベルを作り直したりすると「実装が自分自身に一致する」だけの循環ゲートになる。
+# よって**幾何そのもの**(面の 3 頂点 3D 座標)だけを手がかりに対応を復元する。
+#
+# WHY float32 で突き合わせるか: GLB は頂点座標を float32 で格納するので、
+# 入力(float64 の fixture)と出力(GLB 往復後)を float64 のまま比較すると
+# 一致しない。両辺を `astype(np.float32)` に揃えれば**保存形式の精度で bit 厳密**な
+# 比較になる(実測 2026-08-06: cube / capped_cylinder / torus の 3 fixture とも
+# 往復後の座標が `float32(元座標)` と完全一致、未一致の出力頂点 0 件)。
+# 丸め・許容誤差による「近い頂点」照合は導入しない — 誤対応を黙って作るため。
+# ---------------------------------------------------------------------------
+
+
+def _face_position_key(vertices32: np.ndarray, face: np.ndarray) -> tuple[bytes, ...]:
+    """面の 3 頂点座標を、順序に依らない突き合わせ用のキー(bytes 三つ組)にする。
+
+    Args:
+        vertices32: `(N, 3) float32` の頂点座標。
+        face: 面 1 枚の頂点 index `(3,)`。
+
+    Returns:
+        3 つの座標 bytes を昇順に並べたタプル(corner 順・巻き順に不変)。
+    """
+    return tuple(sorted(vertices32[int(index)].tobytes() for index in face))
+
+
+def _match_faces_by_position(
+    out_mesh: MeshData, in_mesh: MeshData
+) -> tuple[np.ndarray, np.ndarray]:
+    """出力面 → 入力面の対応と corner 置換を、3 頂点 3D 座標の厳密一致で復元する。
+
+    **三つ組の一意性を検査し、一意でなければ `AssertionError` で fail する**
+    (計画v4 §5 Step 2-7)。同じ座標三つ組を持つ面が入力に 2 枚あると対応が定まらず、
+    「たまたま片方に当たった」結果で E2E ゲートが通ってしまうため、skip では
+    握り潰さない。同様に、面内の 3 頂点座標が相異なることも要求する(corner 置換が
+    一意に決まる前提)。
+
+    Args:
+        out_mesh: 出力メッシュ(CLI/`rebake` が書いた GLB を `load_mesh` したもの)。
+        in_mesh: 入力メッシュ。
+
+    Returns:
+        `(face_map, corner_perm)`。`face_map` は `(M_out,) int64` で出力面 → 入力面、
+        `corner_perm` は `(M_out, 3) int64`。両者は
+        `out.vertices[out.faces[i, k]] == in.vertices[in.faces[face_map[i],
+        corner_perm[i, k]]]`(float32 精度で厳密)を満たす。
+
+    Raises:
+        AssertionError: 入力側の面座標三つ組が一意でない、面内に同一座標の頂点が
+            ある、対応する入力面が見つからない、または corner が対応しないとき。
+    """
+    in_v32 = np.asarray(in_mesh.vertices, dtype=np.float32)
+    out_v32 = np.asarray(out_mesh.vertices, dtype=np.float32)
+    in_faces = np.asarray(in_mesh.faces, dtype=np.int64)
+    out_faces = np.asarray(out_mesh.faces, dtype=np.int64)
+
+    face_of_key: dict[tuple[bytes, ...], int] = {}
+    for face_index, face in enumerate(in_faces):
+        corner_keys = [in_v32[int(index)].tobytes() for index in face]
+        assert len(set(corner_keys)) == 3, (
+            f"input face {face_index} has repeated vertex positions, so its corner "
+            "correspondence is ambiguous; the position-based matcher cannot be used "
+            "on this mesh"
+        )
+        key = _face_position_key(in_v32, face)
+        assert key not in face_of_key, (
+            f"input faces {face_of_key[key]} and {face_index} share the same set of "
+            "3D corner positions; the output->input face correspondence would be "
+            "ambiguous, so this fixture cannot be checked by position matching"
+        )
+        face_of_key[key] = face_index
+
+    face_map = np.empty(out_faces.shape[0], dtype=np.int64)
+    corner_perm = np.empty((out_faces.shape[0], 3), dtype=np.int64)
+    for out_index, out_face in enumerate(out_faces):
+        key = _face_position_key(out_v32, out_face)
+        assert key in face_of_key, (
+            f"output face {out_index} has no input face with the same 3 corner "
+            "positions; the rebake pipeline must preserve vertex positions exactly"
+        )
+        in_index = face_of_key[key]
+        in_corner_keys = [in_v32[int(index)].tobytes() for index in in_faces[in_index]]
+        for corner in range(3):
+            out_key = out_v32[int(out_face[corner])].tobytes()
+            assert out_key in in_corner_keys, (
+                f"output face {out_index} corner {corner} does not match any corner "
+                f"of input face {in_index}"
+            )
+            corner_perm[out_index, corner] = in_corner_keys.index(out_key)
+        face_map[out_index] = in_index
+    return face_map, corner_perm
+
+
+def _island_label_violations(
+    faces: np.ndarray, face_labels: np.ndarray
+) -> list[tuple[int, list[int]]]:
+    """2 部位以上にまたがる UV アイランドを列挙する(**検査側**。0 件が正常)。
+
+    `_uv_island_labels`(独立 union-find)でアイランドへ分けてから、アイランドごとの
+    ラベル集合を数える。production の `_check_island_part_consistency` は例外を投げる
+    ので「何件あったか」を測れない。こちらは違反を**値として返す**ので、
+    (a) 実データで 0 件であることと、(b) 手組みの違反データを与えたときに検査が
+    ちゃんと違反を報告すること(sabotage)の両方を同じ関数で確かめられる。
+
+    Args:
+        faces: 面 `(M, 3)`(頂点 index)。
+        face_labels: 面ごとの部位ラベル `(M,)`。
+
+    Returns:
+        `(island_id, sorted(labels))` のリスト(island_id 昇順)。空なら違反なし。
+
+    Raises:
+        ValueError: `face_labels` の長さが面数と合わないとき。
+    """
+    face_array = np.asarray(faces, dtype=np.int64)
+    label_array = np.asarray(face_labels, dtype=np.int64)
+    if label_array.ndim != 1 or label_array.shape[0] != face_array.shape[0]:
+        raise ValueError(
+            f"face_labels must have shape ({face_array.shape[0]},), got "
+            f"{label_array.shape}"
+        )
+    islands = _uv_island_labels(face_array)
+    violations: list[tuple[int, list[int]]] = []
+    for island in range(int(islands.max()) + 1 if islands.size else 0):
+        members = islands == island
+        distinct = np.unique(label_array[members])
+        if distinct.shape[0] > 1:
+            violations.append((island, distinct.tolist()))
+    return violations
+
+
+@pytest.fixture
+def match_faces_by_position() -> Callable[
+    [MeshData, MeshData], tuple[np.ndarray, np.ndarray]
+]:
+    """`_match_faces_by_position`(3D 座標の厳密一致による出力→入力 face 照合)。"""
+    return _match_faces_by_position
+
+
+@pytest.fixture
+def island_label_violations() -> Callable[
+    [np.ndarray, np.ndarray], list[tuple[int, list[int]]]
+]:
+    """`_island_label_violations`(アイランドがまたぐ部位ラベルの列挙)。"""
+    return _island_label_violations

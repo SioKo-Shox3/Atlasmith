@@ -16,10 +16,12 @@
 
 from __future__ import annotations
 
+import gc
 import sys
 import time
 import types
 import warnings
+from collections.abc import Iterator
 from typing import Any, Callable
 
 import numpy as np
@@ -692,6 +694,57 @@ def test_silhouette_point_grid_contract() -> None:
 # ---------------------------------------------------------------------------
 # ML 層のヘルパ
 # ---------------------------------------------------------------------------
+
+
+def _release_cuda_memory() -> None:
+    """torch の caching allocator が抱えた VRAM をドライバへ返す(**テスト専用**)。
+
+    **WHY テスト側だけか**: `torch.cuda.empty_cache()` はプロセス全体の CUDA 状態に
+    触る副作用なので、ライブラリからは呼ばない(`Sam2MaskProposer.close` の
+    docstring がその方針を明記している)。本ファイルの ML テストは pytest 親
+    プロセス内で実重みを構築するため、`close()` で参照を手放したあとも allocator の
+    予約が親に残り続ける。
+
+    **実測(2026-08-06 反証レビューの `nvidia-smi` 並走・82 サンプル)**: 本ファイルの
+    ML テストを終えた時点で親 pytest が約 6.8 GB を保持したままで、次に走る
+    `tests/test_rebake_part.py` の SAM2 subprocess と重畳して `used=15662 MiB /
+    free=714 MiB`(全体 16376 MiB)まで到達していた。free 1078 MiB でも耐えることは
+    実測済みだが、この機械には LM Studio が常駐しており、モデルを載せられれば
+    破綻する余地がある。
+
+    `sys.modules` を見て torch が**既に載っているときだけ**触る: 本ファイルの非 ML
+    テスト(偽 torch を使う)しか走っていない実行で torch を import してしまうと、
+    「`ml` マーカーの item が収集されたときだけ重い import を行う」という
+    `tests/conftest.py` の能力検出の規約(計画v4 §2.7)を壊すため。
+    """
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return
+    gc.collect()  # generator/model への最後の参照(循環参照含む)を先に落とす。
+    if not torch.cuda.is_available():
+        return
+    before = torch.cuda.memory_reserved()
+    torch.cuda.empty_cache()
+    after = torch.cuda.memory_reserved()
+    print(
+        f"\n[step2-5 cuda] torch reserved {before / 2**20:.0f} MiB -> "
+        f"{after / 2**20:.0f} MiB (empty_cache at module teardown)"
+    )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _release_cuda_after_module() -> Iterator[None]:
+    """本ファイルの全テスト終了後に VRAM を解放する(`_release_cuda_memory` の WHY)。
+
+    module スコープなので、ここが走るのは `tests/test_multiview_sam2.py` を出る
+    直前 = 収集順で次に来る `tests/test_rebake_part.py` が SAM2 subprocess を
+    起動する**前**。autouse なのは、解放すべき重みを作るテストが fixture
+    (`sam2_peanut_runs`)経由のものと直接構築するもの(`_build_real_proposer` /
+    `make_sam2_segmenter`)に分かれていて、どれが走っても効かせたいため。
+    torch が載っていない実行では `_release_cuda_memory` が即 return する。
+    """
+    yield
+    _release_cuda_memory()
 
 
 def _one_to_one_accuracy(pred: np.ndarray, true: np.ndarray) -> float:

@@ -7,8 +7,9 @@
 **検証証跡**を残すこと。計画v4(`Docs/plans/2026-07-27-phase2-plan-v4.md`)Step 2-1 の合否ゲート
 【BL-7】および §0-A 条件8(Linux 側依存も検査に含める)の成果物。
 
-**状態**: Step 2-1 時点の記録。Step 2-8 で清書予定(重みのライセンス・学習データの扱い・
-再配布の有無を追記)。
+**状態**: **Step 2-8 で清書済み(2026-08-07)。** §1〜§9 は Step 2-1 / 2-1.5 時点の実測記録
+(**内容は変更していない**)。Step 2-8 で追加したのは **§10(重み・学習データ・再配布)**と
+**§11(候補モデルのライセンス判定表の要約)**。§7 の再検証トリガーは引き続き有効。
 
 ---
 
@@ -226,6 +227,16 @@ PyTorch の index は PyPI のミラーも兼ねているため、`--no-deps` �
 
 (`README.md` には現時点で `cu124` の記述は無い — README のライセンス節・導入手順は Step 2-8 で新設予定。)
 
+**Step 2-8 での追跡(2026-08-07)**【実測 2026-08-07、実装者が実行 — `grep -n "cu124\|cu126"`】:
+
+- `pyproject.toml:17` は **解消済み**。現在は `cu126` を指しており、19 行目が本文書 §6 を参照している。
+- `Docs/agent-guide/technique-ml-part-segmentation.md:212` は **行そのものは `cu124` のまま**
+  (同ファイルは Step 2-8 で**追記のみ**が許可されており、既存行を書き換えていない)。
+  代わりに同ファイル末尾へ「承認事項 H の**実測による訂正**」節を追記し、**正は本文書 §6** であることと
+  訂正2点(cu126 / `--no-deps`)を明記した。同 129 行の `cu124` は**当時の隔離 venv での実測記録**
+  (torch 2.6.0+cu124)であり、**過去の実測として正しい**ので訂正対象ではない。
+- `README.md` には Step 2-8 で `cu126` + `--no-deps` の手順を新設した(本文書 §6.1 と同一手順)。
+
 ---
 
 ## 7. 再検証のトリガー
@@ -248,10 +259,9 @@ PyTorch の index は PyPI のミラーも兼ねているため、`--no-deps` �
 ## 8. 未確認事項(留保 — 検証済みのように書かない)
 
 - **§3.3 の15件の NVIDIA パッケージのライセンスは【推測】。** 同梱 LICENSE を実見していない。
-- **重み(SAM2 checkpoint)のライセンスは本文書では未検証。**
-  既存記録 `Docs/agent-guide/technique-ml-part-segmentation.md`(ライセンス判定表)は
-  「SAM2 のコード・重みとも Apache-2.0【外部】」としているが、**本文書ではこれを再確認していない**。
-  重み・学習データ・再配布の有無の記載は Step 2-8 の清書で行う。
+- ~~**重み(SAM2 checkpoint)のライセンスは本文書では未検証。**~~
+  **→ Step 2-8 で解消**(§10.1 — 一次資料 `facebook/sam2` の LICENSE と README を実取得した)。
+  **ただし学習データ(SA-V)のライセンスは依然として未検証**(§10.2)。
 - **本検査は当開発機で解決された `uv.lock` の内容に対するもの。** 利用者の環境で
   異なるバージョンが解決された場合の結果は保証しない。
 
@@ -344,3 +354,98 @@ import するが、**sam2 パッケージ自身はそれを依存宣言してい
   `uv.lock` 全体(Linux 側を含む)に対して再実行して更新すること**(§3.1 の構造的注意)。
 - 本節の9件は **Windows での dry-run で観測された追加分**である。**Linux 側でさらに追加される
   パッケージがあるかは未確認**(環境マーカー付き依存は当機の dry-run には現れない)。
+
+---
+
+## 10. 重み・学習データ・再配布の有無(Step 2-8 の清書で追加、2026-08-07)
+
+§8 が「Step 2-8 の清書で行う」としていた3点(重みのライセンス / 学習データの扱い /
+再配布の有無)を記録する。**§1〜§9 と違い、本節の一次資料取得は本節の執筆担当(implementer)が
+自分で実行した。**
+
+### 10.1 SAM2 の重み(checkpoint)のライセンス
+
+【実測 2026-08-07、実装者が実行 — GitHub raw から一次資料を実取得】
+
+| 取得したもの | URL | 結果 |
+|---|---|---|
+| `facebook/sam2` の LICENSE 全文 | `https://raw.githubusercontent.com/facebookresearch/sam2/main/LICENSE` | HTTP 200 / **全201行** / 冒頭が `Apache License / Version 2.0, January 2004` / 文字列 `GPL` のヒット **0 件** |
+| 同 README の License 節 | `https://raw.githubusercontent.com/facebookresearch/sam2/main/README.md` | HTTP 200 / 198行目に次の記述 |
+
+> The SAM 2 model checkpoints, SAM 2 demo code (front-end and back-end), and SAM 2 training code
+> are licensed under [Apache 2.0](./LICENSE), however the [Inter Font] and [Noto Color Emoji]
+> used in the SAM 2 demo code are made available under the
+> [SIL Open Font License, version 1.1](https://openfontlicense.org/open-font-license-official-text/).
+
+**判定**: **SAM2 の model checkpoints は Apache-2.0**(コードと同一)。
+既存記録 `Docs/agent-guide/technique-ml-part-segmentation.md` の判定表(「SAM2 のコード・重みとも
+Apache-2.0【外部】」)と**一致する**。§8 の未検証項目はこれで解消。
+
+**留保**: 上記の OFL-1.1 のフォント2件は **demo code 専用**であり、Atlasmith は
+`facebook/sam2` の demo code を使わない(使うのは `SAM2AutomaticMaskGenerator` と
+`build_sam2_hf` の経路のみ)。**したがってフォントは Atlasmith の依存には入らない**が、
+sam2 リポジトリ全体を clone して使う場合は該当しうるので記録しておく。
+
+**SAM3 は使わない**: SAM3 は Apache-2.0 ではなく独自の "SAM License"(軍事用途禁止条項等)である
+【外部 — `technique-ml-part-segmentation.md` の判定表、LICENSE 実確認済みの記録】。
+**SAM2 と混同すると絶対規則3に抵触する。**
+
+### 10.2 学習データの扱い
+
+- SAM2 は Meta 自身が構築した **SA-V データセット**で学習されている
+  【実測 2026-08-07、実装者が実行 — 上記 README 11行目に `our SA-V dataset` として明記、
+  データセット URL は `https://ai.meta.com/datasets/segment-anything-video`】。
+- **SA-V データセット自体のライセンス条項は本記録では未検証。** データセットのページを取得して
+  条項を実見していない。**「Apache-2.0 だ」とも「非商用だ」とも書かない。**
+- **ただし本件で問題になるのは重みの再配布条件であり、Meta は checkpoints 自体を Apache-2.0 で
+  提供している**(§10.1 の一次資料)。Atlasmith は**学習を行わない**し、データセットを取得も
+  再配布もしない。
+- **WHY この欄が重要か**: 本プロジェクトの候補調査では、**過半のモデルが「コードは MIT」なのに
+  重みの学習データ(PartNet / ShapeNet / ScanNet)の非商用条項で脱落した**(§11)。
+  「コードのライセンス」だけを見る検査は本プロジェクトでは不十分である、というのが実測の教訓。
+
+### 10.3 再配布の有無(**Atlasmith は何も同梱しない**)
+
+| 対象 | Atlasmith が同梱・再配布するか | 取得経路 |
+|---|---|---|
+| `[ml]` の直接依存(torch / sam2 / moderngl / huggingface_hub) | **しない** | `uv sync --extra ml` / `pip install atlasmith[ml]` 時にパッケージマネージャが PyPI から利用者環境へ直接取得 |
+| 推移的依存(NVIDIA CUDA ランタイム等) | **しない** | 同上(Linux のみ。§3 / §5) |
+| **SAM2 の重み(checkpoint)** | **しない** | **初回実行時**に `sam2` の `build_sam2_hf` が HuggingFace Hub から取得(**認証不要**【実測 2026-07-27/29、オーケストレーター実行】)。既定 model id は `facebook/sam2.1-hiera-large` |
+| SA-V データセット | **しない**(取得もしない) | — |
+
+- **この「再配布しない」という事実が、§4.2 の裁定(NVIDIA 独自ライセンスを『記録して進む』)と
+  §9.3 の `certifi` MPL-2.0 の評価の、両方の前提になっている。**
+  **配布形態が変わったら(同梱・再配布する形になったら)両方の判断が崩れる** — §7 のトリガー5。
+- 帰属表示は `NOTICE`(Step 2-8 で新設)に記載した。本文書はその詳細版である。
+
+---
+
+## 11. 候補モデルのライセンス判定表(要約転記)
+
+出典: `Docs/agent-guide/technique-ml-part-segmentation.md`「ライセンス判定(コード・重み・
+学習データを別々に確認)」節。**本節は要約であり、一次資料の URL・等級・詳細は出典側が正。**
+
+| 候補 | コード | 重み | 学習データ | 判定 |
+|---|---|---|---|---|
+| **SAM2**(採用) | Apache-2.0 | **Apache-2.0**(§10.1 で実確認) | SA-V(§10.2、条項は未検証) | **互換 YES** |
+| SAM3 | 独自 "SAM License" | 同左 | — | **NO**(SAM2 と混同注意) |
+| SAMPart3D | MIT | MIT | Objaverse への蒸留・PartNet/ShapeNet 不使用 | 互換 YES(将来の追加候補) |
+| tiny-cuda-nn(SAMPart3D 必須依存) | BSD-3-Clause | — | — | 互換 YES |
+| SATR | MIT | 重み無し(zero-shot) | — | 互換 YES |
+| Find3D | MIT | MIT | Objaverse 自動注釈 | 互換 YES |
+| Point-SAM | MIT | — | **PartNet / PartNet-Mobility / ShapeNet / ScanNet(全て非商用研究限定)** | **NO** |
+| PartSLIP / ++ | MIT | — | PartNet-Ensembled(非商用) | **NO** |
+| P3-SAM / Hunyuan3D-Part | Tencent 独自(商用 MAU 上限・地域除外) | 同左 | — | **NO** |
+| **PartField**(NVIDIA) | NVIDIA License §3.3 **非商用限定** | 明示なし | — | **NO** |
+| PartSAM | MIT バッジ | MIT | 不明 | **非推奨**(PartField 由来をREADMEで自認) |
+| PartDistill | **LICENSE ファイル不在** | — | — | **NO**(無許諾) |
+| PointNet++ / PointTransformer 系 part-seg 全般 | 実装ごと | — | ShapeNetPart / PartNet | **NO**(一律) |
+| HoloPart | MIT | MIT | — | タスク不一致(part *completion*) |
+
+**この表の教訓(絶対規則3 の運用上いちばん効く一文)**:
+**「コードは MIT」に釣られてはいけない。候補の過半は、重みの学習データの非商用条項で脱落した。**
+生き残ったのは PartNet / ShapeNet で学習していないもの(Objaverse 系・zero-shot)だけである。
+
+**Atlasmith 本体への影響**: `PartField` は当初 Phase 2 の ML 候補だったが**非商用限定のため却下**
+されている。`CLAUDE.md` / 旧 `architecture.md` に「ML: PartField 予定」という記述が残っていた場合は
+**古い情報**であり、正は本表と `technique-ml-part-segmentation.md` の決定記録(採用 = SAM2 多視点自前実装)。

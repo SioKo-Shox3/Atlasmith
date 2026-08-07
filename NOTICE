@@ -1,0 +1,82 @@
+Atlasmith
+=========
+
+This product is licensed under the Apache License, Version 2.0.
+See the LICENSE file for the full license text.
+
+Atlasmith itself bundles no third-party source code. Its required dependencies
+(trimesh, numpy, Pillow, xatlas) and its optional "[ml]" dependencies are
+fetched from PyPI by the package manager at install time; Atlasmith neither
+vendors nor redistributes them.
+
+
+Optional "[ml]" extra
+---------------------
+
+Installing the optional extra ("uv sync --extra ml" or
+"pip install atlasmith[ml]") pulls in the following direct dependencies:
+
+  * torch (PyTorch) -- composite license expression, all permissive:
+    Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause AND
+    BSD-3-Clause AND BSL-1.0 AND MIT
+    https://github.com/pytorch/pytorch/blob/main/LICENSE
+
+  * sam2 (Segment Anything Model 2, Meta Platforms, Inc.) -- Apache-2.0
+    https://github.com/facebookresearch/sam2
+
+  * moderngl -- MIT
+    https://github.com/moderngl/moderngl
+
+  * huggingface_hub -- Apache-2.0
+    https://github.com/huggingface/huggingface_hub
+
+No GPL, AGPL, or LGPL licensed package was found in the resolved dependency
+set (Windows install set and Linux-only set of uv.lock were both checked).
+
+
+Model weights (SAM2)
+--------------------
+
+Atlasmith does NOT ship, bundle, or redistribute any model weights.
+
+When the SAM2 segmentation backend is used, the weights (default model id
+"facebook/sam2.1-hiera-large") are downloaded at first run from the Hugging
+Face Hub by the sam2 package. No authentication is required.
+
+  * The SAM2 checkpoints are released by Meta Platforms, Inc. under the
+    Apache License, Version 2.0 -- the same license as the SAM2 code.
+  * SAM3 is published under a different, non-Apache "SAM License" and is
+    deliberately NOT used by Atlasmith.
+
+Users are responsible for complying with the license and the terms of use of
+any model weights they download.
+
+
+Third-party runtime components pulled in on Linux
+-------------------------------------------------
+
+On Linux, installing the "[ml]" extra additionally pulls in NVIDIA CUDA
+runtime packages (nvidia-*, cuda-bindings, cuda-toolkit, ...) as transitive
+dependencies of torch. Some of these are distributed under NVIDIA proprietary
+licenses rather than an OSI-approved open source license. They are not
+copyleft and are not redistributed by Atlasmith, but users should be aware of
+them. One dependency (certifi) is licensed under MPL-2.0, a weak, per-file
+copyleft license; Atlasmith does not modify it.
+
+Details, primary sources, evidence grades and the reservations that apply to
+these findings are recorded in:
+
+    Docs/licenses/THIRD-PARTY-ML.md
+
+
+日本語での要約
+--------------
+
+- Atlasmith 本体は Apache-2.0(全文は `LICENSE`)。第三者コードを同梱しない。
+- optional な `[ml]` extras は torch / sam2 / moderngl / huggingface_hub。
+  いずれも permissive で、GPL / AGPL / LGPL は 0 件。
+- **SAM2 の重みは同梱しない。** 初回実行時に HuggingFace Hub から取得する
+  (認証不要)。重み自体も Apache-2.0。SAM3 は別ライセンスのため使用しない。
+- Linux では torch の推移的依存として NVIDIA 独自ライセンスのパッケージが
+  同時に入る(Atlasmith は再配布しない)。`certifi` は MPL-2.0。
+- 一次資料・等級・留保は `Docs/licenses/THIRD-PARTY-ML.md` を参照。
